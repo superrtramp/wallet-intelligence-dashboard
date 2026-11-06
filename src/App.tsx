@@ -21,6 +21,13 @@ type Transaction = {
   timeStamp: string
 }
 
+type FirstSeenResponse = {
+  hash?: string
+  blockNumber?: string
+  timeStamp?: string
+  firstSeen?: null
+}
+
 function shorten(text: string) {
   return `${text.slice(0, 6)}...${text.slice(-4)}`
 }
@@ -35,6 +42,81 @@ async function fetchTransactions(address: string): Promise<Transaction[]> {
   return response.json()
 }
 
+async function fetchFirstSeen(address: string): Promise<FirstSeenResponse> {
+  const response = await fetch(`http://localhost:3001/api/first-seen/${address}`)
+
+  if (!response.ok) {
+    throw new Error('First seen request failed')
+  }
+
+  return response.json()
+}
+
+// Turns a start date into text like "3 years, 4 months", "7 months" or "12 days"
+function formatWalletAge(startDate: Date) {
+  const now = new Date()
+
+  let years = now.getFullYear() - startDate.getFullYear()
+  let months = now.getMonth() - startDate.getMonth()
+
+  if (now.getDate() < startDate.getDate()) {
+    months -= 1
+  }
+
+  if (months < 0) {
+    years -= 1
+    months += 12
+  }
+
+  if (years > 0) {
+    const yearText = `${years} ${years === 1 ? 'year' : 'years'}`
+    if (months === 0) {
+      return yearText
+    }
+    return `${yearText}, ${months} ${months === 1 ? 'month' : 'months'}`
+  }
+
+  if (months > 0) {
+    return `${months} ${months === 1 ? 'month' : 'months'}`
+  }
+
+  const msPerDay = 1000 * 60 * 60 * 24
+  const days = Math.floor((now.getTime() - startDate.getTime()) / msPerDay)
+  return `${days} ${days === 1 ? 'day' : 'days'}`
+}
+
+// Turns a past date into text like "2 hours ago", "4 days ago" or "3 months ago"
+function formatTimeAgo(pastDate: Date) {
+  const seconds = Math.floor((Date.now() - pastDate.getTime()) / 1000)
+
+  if (seconds < 60) {
+    return 'just now'
+  }
+
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) {
+    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'} ago`
+  }
+
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) {
+    return `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`
+  }
+
+  const days = Math.floor(hours / 24)
+  if (days < 30) {
+    return `${days} ${days === 1 ? 'day' : 'days'} ago`
+  }
+
+  const months = Math.floor(days / 30)
+  if (months < 12) {
+    return `${months} ${months === 1 ? 'month' : 'months'} ago`
+  }
+
+  const years = Math.floor(days / 365)
+  return `${years} ${years === 1 ? 'year' : 'years'} ago`
+}
+
 function App() {
   const [address, setAddress] = useState('')
   const [balance, setBalance] = useState('')
@@ -44,9 +126,20 @@ function App() {
   // null = not loaded yet, [] = loaded but empty
   const [transactions, setTransactions] = useState<Transaction[] | null>(null)
   const [transactionError, setTransactionError] = useState('')
+  // null = not loaded yet
+  const [firstSeen, setFirstSeen] = useState<Date | null>(null)
+  const [firstSeenChecked, setFirstSeenChecked] = useState(false)
+  const [firstSeenError, setFirstSeenError] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [backendStatus, setBackendStatus] = useState('')
+
+  // Last Active comes from the newest transaction we already fetched.
+  // The backend returns transactions newest first, so index 0 is the latest.
+  const lastActive =
+    transactions !== null && transactions.length > 0
+      ? new Date(Number(transactions[0].timeStamp) * 1000)
+      : null
 
   async function loadWalletData(validAddress: `0x${string}`) {
     try {
@@ -81,6 +174,20 @@ function App() {
     }
   }
 
+  async function loadFirstSeen(validAddress: string) {
+    try {
+      const data = await fetchFirstSeen(validAddress)
+
+      if (data.timeStamp) {
+        setFirstSeen(new Date(Number(data.timeStamp) * 1000))
+      }
+
+      setFirstSeenChecked(true)
+    } catch (err) {
+      setFirstSeenError('Unable to fetch wallet age')
+    }
+  }
+
   async function handleAnalyze() {
     setError('')
     setBalance('')
@@ -89,6 +196,9 @@ function App() {
     setBlockNumber('')
     setTransactions(null)
     setTransactionError('')
+    setFirstSeen(null)
+    setFirstSeenChecked(false)
+    setFirstSeenError('')
 
     if (!isAddress(address)) {
       setError('Invalid Ethereum address')
@@ -98,8 +208,12 @@ function App() {
     setLoading(true)
 
     // Each function handles its own errors, so one failing
-    // does not break the other. They still run at the same time.
-    await Promise.all([loadWalletData(address), loadTransactions(address)])
+    // does not break the others. They still run at the same time.
+    await Promise.all([
+      loadWalletData(address),
+      loadTransactions(address),
+      loadFirstSeen(address),
+    ])
 
     setLoading(false)
   }
@@ -139,6 +253,26 @@ function App() {
       {accountType && <p>Account Type: {accountType}</p>}
       {blockNumber && <p>Current Block: {blockNumber}</p>}
       {error && <p>{error}</p>}
+
+      {firstSeen && (
+        <>
+          <p>First Seen: {firstSeen.toLocaleString()}</p>
+          <p>Wallet Age: {formatWalletAge(firstSeen)}</p>
+        </>
+      )}
+
+      {firstSeenChecked && !firstSeen && (
+        <p>First Seen: No transaction history found</p>
+      )}
+
+      {firstSeenError && <p>{firstSeenError}</p>}
+
+      {lastActive && (
+        <>
+          <p>Last Active: {lastActive.toLocaleString()}</p>
+          <p>Last Active: {formatTimeAgo(lastActive)}</p>
+        </>
+      )}
 
       {transactionError && <p>{transactionError}</p>}
 

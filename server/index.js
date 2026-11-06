@@ -57,6 +57,51 @@ app.get('/api/transactions/:address', async (req, res) => {
   }
 })
 
+app.get('/api/first-seen/:address', async (req, res) => {
+  const { address } = req.params
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' })
+  }
+
+  const params = new URLSearchParams({
+    chainid: '1',
+    module: 'account',
+    action: 'txlist',
+    address,
+    startblock: '0',
+    endblock: '99999999',
+    page: '1',
+    offset: '1',
+    sort: 'asc',
+    apikey: ETHERSCAN_API_KEY,
+  })
+
+  try {
+    const response = await fetch(`https://api.etherscan.io/v2/api?${params}`)
+    const data = await response.json()
+
+    // Etherscan returns an array on success (empty if no transactions)
+    if (!Array.isArray(data.result)) {
+      return res.status(502).json({ error: 'Unable to fetch first seen data' })
+    }
+
+    if (data.result.length === 0) {
+      return res.json({ firstSeen: null })
+    }
+
+    const firstTx = data.result[0]
+
+    res.json({
+      hash: firstTx.hash,
+      blockNumber: firstTx.blockNumber,
+      timeStamp: firstTx.timeStamp,
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'Unable to fetch first seen data' })
+  }
+})
+
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`)
 })
