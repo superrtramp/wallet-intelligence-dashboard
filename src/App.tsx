@@ -117,8 +117,32 @@ function formatTimeAgo(pastDate: Date) {
   return `${years} ${years === 1 ? 'year' : 'years'} ago`
 }
 
+// Works out the searched wallet's role in a normal transaction.
+// Addresses are lowercased first so letter case never affects the comparison.
+function getTransactionDirection(tx: Transaction, walletAddress: string) {
+  const wallet = walletAddress.toLowerCase()
+  const from = tx.from.toLowerCase()
+  const to = (tx.to || '').toLowerCase() // "to" can be empty for contract creation
+
+  if (from === wallet && to === wallet) {
+    return 'SELF'
+  }
+
+  if (from === wallet) {
+    return 'OUT'
+  }
+
+  if (to === wallet) {
+    return 'IN'
+  }
+
+  return 'UNKNOWN'
+}
+
 function App() {
   const [address, setAddress] = useState('')
+  // The address that was actually analyzed (the input box can change afterwards)
+  const [analyzedAddress, setAnalyzedAddress] = useState('')
   const [balance, setBalance] = useState('')
   const [transactionCount, setTransactionCount] = useState<number | null>(null)
   const [accountType, setAccountType] = useState('')
@@ -199,12 +223,14 @@ function App() {
     setFirstSeen(null)
     setFirstSeenChecked(false)
     setFirstSeenError('')
+    setAnalyzedAddress('')
 
     if (!isAddress(address)) {
       setError('Invalid Ethereum address')
       return
     }
 
+    setAnalyzedAddress(address)
     setLoading(true)
 
     // Each function handles its own errors, so one failing
@@ -285,7 +311,8 @@ function App() {
           <h2>Recent Transactions</h2>
           {transactions.map((tx) => (
             <p key={tx.hash}>
-              Hash: {shorten(tx.hash)} | From: {shorten(tx.from)} | To:{' '}
+              {getTransactionDirection(tx, analyzedAddress)} | Hash:{' '}
+              {shorten(tx.hash)} | From: {shorten(tx.from)} | To:{' '}
               {tx.to ? shorten(tx.to) : 'Contract Creation'} | Value:{' '}
               {formatEther(BigInt(tx.value))} ETH |{' '}
               {new Date(Number(tx.timeStamp) * 1000).toLocaleString()}
