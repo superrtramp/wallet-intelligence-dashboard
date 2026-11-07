@@ -7,11 +7,26 @@ import {
 } from 'viem'
 import { mainnet } from 'viem/chains'
 
-const publicClient = createPublicClient({
-  chain: mainnet,
-  transport: http(),
-})
+// --- RPC configuration -------------------------------------------------
+// Vite exposes only variables starting with VITE_ to frontend code.
+// These values are shipped to the browser, so they are NOT secret.
+const PRIMARY_RPC_URL = import.meta.env.VITE_PRIMARY_RPC_URL as string | undefined
+const BACKUP_RPC_URL = import.meta.env.VITE_BACKUP_RPC_URL as string | undefined
 
+function makeClient(rpcUrl: string | undefined) {
+  return createPublicClient({
+    chain: mainnet,
+    transport: http(rpcUrl),
+  })
+}
+
+// Two separate clients, one per provider. We try them manually, in order.
+const primaryClient = makeClient(PRIMARY_RPC_URL)
+const backupClient = makeClient(BACKUP_RPC_URL)
+
+type RpcClient = ReturnType<typeof makeClient>
+
+// --- Types -------------------------------------------------------------
 type Transaction = {
   hash: string
   from: string
@@ -28,8 +43,80 @@ type FirstSeenResponse = {
   firstSeen?: null
 }
 
+// The ONE shape the rest of the app uses, no matter which provider answered.
+type WalletData = {
+  balance: string // ETH, already formatted
+  nonce: number
+  accountType: 'EOA' | 'Contract'
+  blockNumber: string | null
+}
+
+type WalletDataSource = 'Primary RPC' | 'Backup RPC' | 'Etherscan fallback'
+
+// --- Helpers -----------------------------------------------------------
 function shorten(text: string) {
   return `${text.slice(0, 6)}...${text.slice(-4)}`
+}
+
+// NORMALIZATION: every provider's raw answers pass through this one function,
+// so they all end up as the same WalletData shape.
+function buildWalletData(
+  balanceWei: bigint,
+  nonce: number,
+  bytecode: string | undefined,
+  blockNumber: bigint | null,
+): WalletData {
+  const isContract = Boolean(bytecode) && bytecode !== '0x'
+
+  return {
+    balance: formatEther(balanceWei),
+    nonce,
+    accountType: isContract ? 'Contract' : 'EOA',
+blockNumber: blockNumber !== null ? blockNumber.toString() : null,  }
+}
+
+// Asks ONE viem client for the wallet info. The four calls are independent,
+// so they run at the same time with Promise.all.
+async function getWalletDataFromRpc(
+  client: RpcClient,
+  rpcUrl: string | undefined,
+  address: `0x${string}`,
+): Promise<WalletData> {
+  // Without this check, http(undefined) would silently use viem's default
+  // public RPC and hide a missing configuration.
+  if (!rpcUrl) {
+    throw new Error('RPC URL is not set')
+  }
+
+  const [balanceWei, nonce, bytecode, blockNumber] = await Promise.all([
+    client.getBalance({ address }),
+    client.getTransactionCount({ address }), // this is the account nonce
+    client.getBytecode({ address }),
+    client.getBlockNumber(),
+  ])
+
+  return buildWalletData(balanceWei, nonce, bytecode, blockNumber)
+}
+
+// Last resort: ask OUR backend, which asks Etherscan. The backend sends back
+// plain strings (JSON cannot carry bigint), and we normalize them here.
+async function getWalletDataFromEtherscanFallback(
+  address: string,
+): Promise<WalletData> {
+  const response = await fetch(`http://localhost:3001/api/wallet-fallback/${address}`)
+
+  if (!response.ok) {
+    throw new Error('Wallet fallback request failed')
+  }
+
+  const data = await response.json()
+
+  return buildWalletData(
+    BigInt(data.balanceWei),
+    Number(data.nonce),
+    data.bytecode,
+    null,
+  )
 }
 
 async function fetchTransactions(address: string): Promise<Transaction[]> {
@@ -144,9 +231,11 @@ function App() {
   // The address that was actually analyzed (the input box can change afterwards)
   const [analyzedAddress, setAnalyzedAddress] = useState('')
   const [balance, setBalance] = useState('')
-  const [transactionCount, setTransactionCount] = useState<number | null>(null)
+  const [nonce, setNonce] = useState<number | null>(null)
   const [accountType, setAccountType] = useState('')
   const [blockNumber, setBlockNumber] = useState('')
+  // Which source actually supplied the wallet data ('' = none yet)
+  const [walletDataSource, setWalletDataSource] = useState<WalletDataSource | ''>('')
   // null = not loaded yet, [] = loaded but empty
   const [transactions, setTransactions] = useState<Transaction[] | null>(null)
   const [transactionError, setTransactionError] = useState('')
@@ -165,28 +254,48 @@ function App() {
       ? new Date(Number(transactions[0].timeStamp) * 1000)
       : null
 
+  // Copies normalized wallet data into React state. It doesn't care
+  // which provider produced the data, only which label to show.
+  function showWalletData(data: WalletData, source: WalletDataSource) {
+    setBalance(data.balance)
+    setNonce(data.nonce)
+    setAccountType(data.accountType)
+    setBlockNumber(data.blockNumber ?? '')
+    setWalletDataSource(source)
+  }
+
+  // FAILOVER: try each source in order. The first success returns immediately,
+  // so later sources are never contacted. A failure is caught and we move on.
   async function loadWalletData(validAddress: `0x${string}`) {
+    // 1. Primary RPC
     try {
-      const [rawBalance, count, bytecode, block] = await Promise.all([
-        publicClient.getBalance({ address: validAddress }),
-        publicClient.getTransactionCount({ address: validAddress }),
-        publicClient.getBytecode({ address: validAddress }),
-        publicClient.getBlockNumber(),
-      ])
-
-      setBalance(formatEther(rawBalance))
-      setTransactionCount(count)
-
-      if (bytecode && bytecode !== '0x') {
-        setAccountType('Contract')
-      } else {
-        setAccountType('EOA')
-      }
-
-      setBlockNumber(block.toString())
+      const data = await getWalletDataFromRpc(primaryClient, PRIMARY_RPC_URL, validAddress)
+      showWalletData(data, 'Primary RPC')
+      return
     } catch (err) {
-      setError('Unable to fetch wallet data')
+      console.warn('Primary RPC failed, trying backup RPC', err)
     }
+
+    // 2. Backup RPC
+    try {
+      const data = await getWalletDataFromRpc(backupClient, BACKUP_RPC_URL, validAddress)
+      showWalletData(data, 'Backup RPC')
+      return
+    } catch (err) {
+      console.warn('Backup RPC failed, trying Etherscan fallback', err)
+    }
+
+    // 3. Etherscan fallback through our backend
+    try {
+      const data = await getWalletDataFromEtherscanFallback(validAddress)
+      showWalletData(data, 'Etherscan fallback')
+      return
+    } catch (err) {
+      console.warn('Etherscan fallback failed', err)
+    }
+
+    // 4. Everything failed
+    setError('Unable to fetch wallet data')
   }
 
   async function loadTransactions(validAddress: string) {
@@ -215,9 +324,10 @@ function App() {
   async function handleAnalyze() {
     setError('')
     setBalance('')
-    setTransactionCount(null)
+    setNonce(null)
     setAccountType('')
     setBlockNumber('')
+    setWalletDataSource('')
     setTransactions(null)
     setTransactionError('')
     setFirstSeen(null)
@@ -275,9 +385,10 @@ function App() {
         {loading ? 'Analyzing...' : 'Analyze Wallet'}
       </button>
       {balance && <p>ETH Balance: {balance} ETH</p>}
-      {transactionCount !== null && <p>Transaction Count: {transactionCount}</p>}
+      {nonce !== null && <p>Nonce: {nonce}</p>}
       {accountType && <p>Account Type: {accountType}</p>}
       {blockNumber && <p>Current Block: {blockNumber}</p>}
+      {walletDataSource && <p>Data Source: {walletDataSource}</p>}
       {error && <p>{error}</p>}
 
       {firstSeen && (
