@@ -6,6 +6,11 @@ import {
   formatEther,
 } from 'viem'
 import { mainnet } from 'viem/chains'
+import './App.css'
+import type { Transaction } from './types'
+import WalletSummary from './components/WalletSummary'
+import ActivitySummary from './components/ActivitySummary'
+import TransactionList from './components/TransactionList'
 
 // --- RPC configuration -------------------------------------------------
 // Vite exposes only variables starting with VITE_ to frontend code.
@@ -27,19 +32,6 @@ const backupClient = makeClient(BACKUP_RPC_URL)
 type RpcClient = ReturnType<typeof makeClient>
 
 // --- Types -------------------------------------------------------------
-type Transaction = {
-  hash: string
-  from: string
-  to: string
-  value: string
-  blockNumber: string
-  timeStamp: string
-  input: string
-  methodId: string
-  functionName: string
-  contractAddress: string
-}
-
 type FirstSeenResponse = {
   hash?: string
   blockNumber?: string
@@ -57,10 +49,7 @@ type WalletData = {
 
 type WalletDataSource = 'Primary RPC' | 'Backup RPC' | 'Etherscan fallback'
 
-// --- Helpers -----------------------------------------------------------
-function shorten(text: string) {
-  return `${text.slice(0, 6)}...${text.slice(-4)}`
-}
+// --- Data helpers (unchanged) -------------------------------------------
 
 // NORMALIZATION: every provider's raw answers pass through this one function,
 // so they all end up as the same WalletData shape.
@@ -142,129 +131,6 @@ async function fetchFirstSeen(address: string): Promise<FirstSeenResponse> {
   }
 
   return response.json()
-}
-
-// Turns a start date into text like "3 years, 4 months", "7 months" or "12 days"
-function formatWalletAge(startDate: Date) {
-  const now = new Date()
-
-  let years = now.getFullYear() - startDate.getFullYear()
-  let months = now.getMonth() - startDate.getMonth()
-
-  if (now.getDate() < startDate.getDate()) {
-    months -= 1
-  }
-
-  if (months < 0) {
-    years -= 1
-    months += 12
-  }
-
-  if (years > 0) {
-    const yearText = `${years} ${years === 1 ? 'year' : 'years'}`
-    if (months === 0) {
-      return yearText
-    }
-    return `${yearText}, ${months} ${months === 1 ? 'month' : 'months'}`
-  }
-
-  if (months > 0) {
-    return `${months} ${months === 1 ? 'month' : 'months'}`
-  }
-
-  const msPerDay = 1000 * 60 * 60 * 24
-  const days = Math.floor((now.getTime() - startDate.getTime()) / msPerDay)
-  return `${days} ${days === 1 ? 'day' : 'days'}`
-}
-
-// Turns a past date into text like "2 hours ago", "4 days ago" or "3 months ago"
-function formatTimeAgo(pastDate: Date) {
-  const seconds = Math.floor((Date.now() - pastDate.getTime()) / 1000)
-
-  if (seconds < 60) {
-    return 'just now'
-  }
-
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) {
-    return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'} ago`
-  }
-
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) {
-    return `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`
-  }
-
-  const days = Math.floor(hours / 24)
-  if (days < 30) {
-    return `${days} ${days === 1 ? 'day' : 'days'} ago`
-  }
-
-  const months = Math.floor(days / 30)
-  if (months < 12) {
-    return `${months} ${months === 1 ? 'month' : 'months'} ago`
-  }
-
-  const years = Math.floor(days / 365)
-  return `${years} ${years === 1 ? 'year' : 'years'} ago`
-}
-
-// DIRECTION: the searched wallet's role in a normal transaction.
-// Addresses are lowercased first so letter case never affects the comparison.
-function getTransactionDirection(tx: Transaction, walletAddress: string) {
-  const wallet = walletAddress.toLowerCase()
-  const from = tx.from.toLowerCase()
-  const to = (tx.to || '').toLowerCase() // "to" can be empty for contract creation
-
-  if (from === wallet && to === wallet) {
-    return 'SELF'
-  }
-
-  if (from === wallet) {
-    return 'OUT'
-  }
-
-  if (to === wallet) {
-    return 'IN'
-  }
-
-  return 'UNKNOWN'
-}
-
-// TYPE: what kind of transaction structure this is. Kept separate from
-// direction on purpose. These are conservative heuristics based on the
-// transaction's own fields, not proof of application-level intent.
-function getTransactionType(tx: Transaction) {
-  // Rule 1: no "to" address means the transaction deploys a new contract
-  if (!tx.to) {
-    return 'Contract Creation'
-  }
-
-  // Rule 2: non-empty calldata strongly suggests a contract interaction
-  if (tx.input !== '0x') {
-    return 'Contract Interaction'
-  }
-
-  // Rules 3 and 4: empty calldata, so decide by the ETH value (in wei)
-  if (BigInt(tx.value) > 0n) {
-    return 'ETH Transfer'
-  }
-
-  return 'Zero-value Transaction'
-}
-
-// Optional extra detail for Contract Interaction, using data Etherscan
-// already gave us. No ABI decoding and no extra API calls.
-function getFunctionInfo(tx: Transaction) {
-  if (tx.functionName) {
-    return tx.functionName
-  }
-
-  if (tx.methodId && tx.methodId !== '0x') {
-    return `Method: ${tx.methodId}`
-  }
-
-  return ''
 }
 
 function App() {
@@ -412,80 +278,75 @@ function App() {
     }
   }
 
+  // App.tsx owns the state and logic. Below, it only hands data
+  // to presentation components through props.
   return (
-    <section id="center">
-      <h1>Wallet Intelligence V2.5 TEST</h1>
-      <p>Enter an Ethereum address to inspect the wallet.</p>
-      <input
-        type="text"
-        placeholder="0x..."
-        value={address}
-        onChange={(e) => setAddress(e.target.value)}
-      />
-      <button type="button" onClick={handleAnalyze} disabled={loading}>
-        {loading ? 'Analyzing...' : 'Analyze Wallet'}
-      </button>
-      {balance && <p>ETH Balance: {balance} ETH</p>}
-      {nonce !== null && <p>Nonce: {nonce}</p>}
-      {accountType && <p>Account Type: {accountType}</p>}
-      {blockNumber && <p>Current Block: {blockNumber}</p>}
-      {walletDataSource && <p>Data Source: {walletDataSource}</p>}
-      {error && <p>{error}</p>}
+    <main className="app">
+      <header className="app-header">
+        <h1>Wallet Intelligence</h1>
+        <p className="subtitle">Enter an Ethereum address to inspect the wallet.</p>
+      </header>
 
-      {firstSeen && (
+      <div className="search-row">
+        <input
+          className="address-input"
+          type="text"
+          placeholder="Ethereum address (0x...)"
+          aria-label="Ethereum wallet address"
+          spellCheck={false}
+          autoComplete="off"
+          value={address}
+          onChange={(e) => setAddress(e.target.value)}
+        />
+        <button
+          className="button-primary"
+          type="button"
+          onClick={handleAnalyze}
+          disabled={loading}
+        >
+          {loading ? 'Analyzing...' : 'Analyze Wallet'}
+        </button>
+      </div>
+
+      {error && (
+        <p className="message message-error" role="alert">
+          {error}
+        </p>
+      )}
+
+      {analyzedAddress && (
         <>
-          <p>First Seen: {firstSeen.toLocaleString()}</p>
-          <p>Wallet Age: {formatWalletAge(firstSeen)}</p>
+          <WalletSummary
+            address={analyzedAddress}
+            balance={balance}
+            nonce={nonce}
+            accountType={accountType}
+            blockNumber={blockNumber}
+            dataSource={walletDataSource}
+          />
+
+          <ActivitySummary
+            firstSeen={firstSeen}
+            firstSeenChecked={firstSeenChecked}
+            firstSeenError={firstSeenError}
+            lastActive={lastActive}
+          />
+
+          <TransactionList
+            transactions={transactions}
+            transactionError={transactionError}
+            analyzedAddress={analyzedAddress}
+          />
         </>
       )}
 
-      {firstSeenChecked && !firstSeen && (
-        <p>First Seen: No transaction history found</p>
-      )}
-
-      {firstSeenError && <p>{firstSeenError}</p>}
-
-      {lastActive && (
-        <>
-          <p>Last Active: {lastActive.toLocaleString()}</p>
-          <p>Last Active: {formatTimeAgo(lastActive)}</p>
-        </>
-      )}
-
-      {transactionError && <p>{transactionError}</p>}
-
-      {transactions !== null && transactions.length === 0 && (
-        <p>No recent transactions found</p>
-      )}
-
-      {transactions !== null && transactions.length > 0 && (
-        <div>
-          <h2>Recent Transactions</h2>
-          {transactions.map((tx) => {
-            const type = getTransactionType(tx)
-            // Function info only makes sense for contract interactions
-            const functionInfo =
-              type === 'Contract Interaction' ? getFunctionInfo(tx) : ''
-
-            return (
-              <p key={tx.hash}>
-                {getTransactionDirection(tx, analyzedAddress)} | {type}
-                {functionInfo && ` | ${functionInfo}`} | Hash: {shorten(tx.hash)} |
-                From: {shorten(tx.from)} | To:{' '}
-                {tx.to ? shorten(tx.to) : 'Contract Creation'} | Value:{' '}
-                {formatEther(BigInt(tx.value))} ETH |{' '}
-                {new Date(Number(tx.timeStamp) * 1000).toLocaleString()}
-              </p>
-            )
-          })}
-        </div>
-      )}
-
-      <button type="button" onClick={handleCheckBackend}>
-        Check Backend
-      </button>
-      {backendStatus && <p>Backend Status: {backendStatus}</p>}
-    </section>
+      <footer className="dev-tools">
+        <button className="button-secondary" type="button" onClick={handleCheckBackend}>
+          Check Backend
+        </button>
+        {backendStatus && <span>Backend Status: {backendStatus}</span>}
+      </footer>
+    </main>
   )
 }
 
