@@ -42,6 +42,8 @@ app.get('/api/transactions/:address', async (req, res) => {
       return res.status(502).json({ error: 'Unable to fetch transactions' })
     }
 
+    // Same single request as before. We just keep more of the fields
+    // Etherscan already sent us, instead of discarding them.
     const transactions = data.result.map((tx) => ({
       hash: tx.hash,
       from: tx.from,
@@ -49,6 +51,10 @@ app.get('/api/transactions/:address', async (req, res) => {
       value: tx.value,
       blockNumber: tx.blockNumber,
       timeStamp: tx.timeStamp,
+      input: tx.input,
+      methodId: tx.methodId,
+      functionName: tx.functionName,
+      contractAddress: tx.contractAddress,
     }))
 
     res.json(transactions)
@@ -109,7 +115,7 @@ async function callEtherscan(params) {
   const query = new URLSearchParams({
     chainid: '1',
     ...params,
-    apikey: ETHERSCAN_API_KEY,
+    apikey: ETHERSCAN_API_KEY, // stays on the server, never sent to React
   })
 
   const response = await fetch(`https://api.etherscan.io/v2/api?${query}`)
@@ -179,11 +185,12 @@ app.get('/api/wallet-fallback/:address', async (req, res) => {
 
     // NORMALIZE: convert everything into plain JSON-safe values.
     // (BigInt cannot be sent as JSON, so big numbers travel as strings.)
-   res.json({
-  balanceWei: balanceData.result,
-  nonce: Number(BigInt(readHexResult(nonceData))),
-  bytecode: readHexResult(codeData),
-})
+    res.json({
+      balanceWei: balanceData.result,
+      nonce: Number(BigInt(readHexResult(nonceData))),
+      bytecode: readHexResult(codeData),
+      blockNumber: BigInt(readHexResult(blockData)).toString(),
+    })
   } catch (err) {
     // Deliberately no error details: nothing sensitive can leak
     res.status(502).json({ error: 'Unable to fetch wallet fallback data' })

@@ -34,6 +34,10 @@ type Transaction = {
   value: string
   blockNumber: string
   timeStamp: string
+  input: string
+  methodId: string
+  functionName: string
+  contractAddress: string
 }
 
 type FirstSeenResponse = {
@@ -48,7 +52,7 @@ type WalletData = {
   balance: string // ETH, already formatted
   nonce: number
   accountType: 'EOA' | 'Contract'
-  blockNumber: string | null
+  blockNumber: string
 }
 
 type WalletDataSource = 'Primary RPC' | 'Backup RPC' | 'Etherscan fallback'
@@ -64,7 +68,7 @@ function buildWalletData(
   balanceWei: bigint,
   nonce: number,
   bytecode: string | undefined,
-  blockNumber: bigint | null,
+  blockNumber: bigint,
 ): WalletData {
   const isContract = Boolean(bytecode) && bytecode !== '0x'
 
@@ -72,7 +76,8 @@ function buildWalletData(
     balance: formatEther(balanceWei),
     nonce,
     accountType: isContract ? 'Contract' : 'EOA',
-blockNumber: blockNumber !== null ? blockNumber.toString() : null,  }
+    blockNumber: blockNumber.toString(),
+  }
 }
 
 // Asks ONE viem client for the wallet info. The four calls are independent,
@@ -115,7 +120,7 @@ async function getWalletDataFromEtherscanFallback(
     BigInt(data.balanceWei),
     Number(data.nonce),
     data.bytecode,
-    null,
+    BigInt(data.blockNumber),
   )
 }
 
@@ -204,7 +209,7 @@ function formatTimeAgo(pastDate: Date) {
   return `${years} ${years === 1 ? 'year' : 'years'} ago`
 }
 
-// Works out the searched wallet's role in a normal transaction.
+// DIRECTION: the searched wallet's role in a normal transaction.
 // Addresses are lowercased first so letter case never affects the comparison.
 function getTransactionDirection(tx: Transaction, walletAddress: string) {
   const wallet = walletAddress.toLowerCase()
@@ -224,6 +229,42 @@ function getTransactionDirection(tx: Transaction, walletAddress: string) {
   }
 
   return 'UNKNOWN'
+}
+
+// TYPE: what kind of transaction structure this is. Kept separate from
+// direction on purpose. These are conservative heuristics based on the
+// transaction's own fields, not proof of application-level intent.
+function getTransactionType(tx: Transaction) {
+  // Rule 1: no "to" address means the transaction deploys a new contract
+  if (!tx.to) {
+    return 'Contract Creation'
+  }
+
+  // Rule 2: non-empty calldata strongly suggests a contract interaction
+  if (tx.input !== '0x') {
+    return 'Contract Interaction'
+  }
+
+  // Rules 3 and 4: empty calldata, so decide by the ETH value (in wei)
+  if (BigInt(tx.value) > 0n) {
+    return 'ETH Transfer'
+  }
+
+  return 'Zero-value Transaction'
+}
+
+// Optional extra detail for Contract Interaction, using data Etherscan
+// already gave us. No ABI decoding and no extra API calls.
+function getFunctionInfo(tx: Transaction) {
+  if (tx.functionName) {
+    return tx.functionName
+  }
+
+  if (tx.methodId && tx.methodId !== '0x') {
+    return `Method: ${tx.methodId}`
+  }
+
+  return ''
 }
 
 function App() {
@@ -260,7 +301,7 @@ function App() {
     setBalance(data.balance)
     setNonce(data.nonce)
     setAccountType(data.accountType)
-    setBlockNumber(data.blockNumber ?? '')
+    setBlockNumber(data.blockNumber)
     setWalletDataSource(source)
   }
 
@@ -373,7 +414,7 @@ function App() {
 
   return (
     <section id="center">
-      <h1>Wallet Intelligence</h1>
+      <h1>Wallet Intelligence V2.5 TEST</h1>
       <p>Enter an Ethereum address to inspect the wallet.</p>
       <input
         type="text"
@@ -420,15 +461,23 @@ function App() {
       {transactions !== null && transactions.length > 0 && (
         <div>
           <h2>Recent Transactions</h2>
-          {transactions.map((tx) => (
-            <p key={tx.hash}>
-              {getTransactionDirection(tx, analyzedAddress)} | Hash:{' '}
-              {shorten(tx.hash)} | From: {shorten(tx.from)} | To:{' '}
-              {tx.to ? shorten(tx.to) : 'Contract Creation'} | Value:{' '}
-              {formatEther(BigInt(tx.value))} ETH |{' '}
-              {new Date(Number(tx.timeStamp) * 1000).toLocaleString()}
-            </p>
-          ))}
+          {transactions.map((tx) => {
+            const type = getTransactionType(tx)
+            // Function info only makes sense for contract interactions
+            const functionInfo =
+              type === 'Contract Interaction' ? getFunctionInfo(tx) : ''
+
+            return (
+              <p key={tx.hash}>
+                {getTransactionDirection(tx, analyzedAddress)} | {type}
+                {functionInfo && ` | ${functionInfo}`} | Hash: {shorten(tx.hash)} |
+                From: {shorten(tx.from)} | To:{' '}
+                {tx.to ? shorten(tx.to) : 'Contract Creation'} | Value:{' '}
+                {formatEther(BigInt(tx.value))} ETH |{' '}
+                {new Date(Number(tx.timeStamp) * 1000).toLocaleString()}
+              </p>
+            )
+          })}
         </div>
       )}
 
