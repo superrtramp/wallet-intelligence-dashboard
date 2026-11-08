@@ -108,6 +108,68 @@ app.get('/api/first-seen/:address', async (req, res) => {
   }
 })
 
+// --- V2.7: historical normal-transaction dataset (for analysis, not UI) ---
+
+// The size of our analysis window. Etherscan allows page * offset <= 10,000,
+// so one request with offset=1000 is allowed. The backend owns this number.
+const HISTORY_LIMIT = 1000
+
+app.get('/api/history/:address', async (req, res) => {
+  const { address } = req.params
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' })
+  }
+
+  const params = new URLSearchParams({
+    chainid: '1',
+    module: 'account',
+    action: 'txlist',
+    address,
+    startblock: '0',
+    endblock: '99999999',
+    page: '1',
+    offset: String(HISTORY_LIMIT),
+    sort: 'desc', // newest first, so we get the most RECENT window
+    apikey: ETHERSCAN_API_KEY,
+  })
+
+  try {
+    const response = await fetch(`https://api.etherscan.io/v2/api?${params}`)
+    const data = await response.json()
+
+    // Errors such as a rate limit arrive with HTTP 200 and a text `result`,
+    // so we check the shape ourselves. An empty array is valid (no history).
+    if (!Array.isArray(data.result)) {
+      return res.status(502).json({ error: 'Unable to fetch transaction history' })
+    }
+
+    // Keep the raw fields future relationship analysis will need.
+    const transactions = data.result.map((tx) => ({
+      hash: tx.hash,
+      from: tx.from,
+      to: tx.to,
+      value: tx.value,
+      blockNumber: tx.blockNumber,
+      timeStamp: tx.timeStamp,
+      input: tx.input,
+      methodId: tx.methodId,
+      functionName: tx.functionName,
+      contractAddress: tx.contractAddress,
+    }))
+
+    res.json({
+      transactions,
+      requestedLimit: HISTORY_LIMIT,
+      // If we got a full window, the wallet may have older transactions we
+      // did not fetch. This is NOT proof there are more, only that we hit the cap.
+      mayHaveMore: transactions.length >= HISTORY_LIMIT,
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'Unable to fetch transaction history' })
+  }
+})
+
 // --- V2.4.1: Etherscan emergency fallback for wallet data ---------------
 
 // Small helper used only by the fallback route: one Etherscan V2 request.

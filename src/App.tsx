@@ -7,7 +7,8 @@ import {
 } from 'viem'
 import { mainnet } from 'viem/chains'
 import './App.css'
-import type { Transaction } from './types'
+import type { HistoryResponse, Transaction } from './types'
+import { formatDateTime } from './utils'
 import WalletSummary from './components/WalletSummary'
 import ActivitySummary from './components/ActivitySummary'
 import TransactionList from './components/TransactionList'
@@ -133,6 +134,17 @@ async function fetchFirstSeen(address: string): Promise<FirstSeenResponse> {
   return response.json()
 }
 
+// V2.7: the deeper analysis dataset (up to ~1000 normal transactions)
+async function fetchHistory(address: string): Promise<HistoryResponse> {
+  const response = await fetch(`http://localhost:3001/api/history/${address}`)
+
+  if (!response.ok) {
+    throw new Error('History request failed')
+  }
+
+  return response.json()
+}
+
 function App() {
   const [address, setAddress] = useState('')
   // The address that was actually analyzed (the input box can change afterwards)
@@ -143,9 +155,17 @@ function App() {
   const [blockNumber, setBlockNumber] = useState('')
   // Which source actually supplied the wallet data ('' = none yet)
   const [walletDataSource, setWalletDataSource] = useState<WalletDataSource | ''>('')
+  // RECENT UI data: the latest 5 normal transactions shown as cards.
   // null = not loaded yet, [] = loaded but empty
   const [transactions, setTransactions] = useState<Transaction[] | null>(null)
   const [transactionError, setTransactionError] = useState('')
+  // ANALYSIS data: up to ~1000 normal transactions, kept in memory, NEVER rendered.
+  // null = not loaded yet
+  const [normalTransactionHistory, setNormalTransactionHistory] =
+    useState<Transaction[] | null>(null)
+  // true if the window was full, so older transactions may exist
+  const [historyMayHaveMore, setHistoryMayHaveMore] = useState(false)
+  const [historyError, setHistoryError] = useState('')
   // null = not loaded yet
   const [firstSeen, setFirstSeen] = useState<Date | null>(null)
   const [firstSeenChecked, setFirstSeenChecked] = useState(false)
@@ -214,6 +234,23 @@ function App() {
     }
   }
 
+  // V2.7: has its own try/catch, so a failure here cannot affect any other feature.
+  async function loadHistory(validAddress: string) {
+    try {
+      const data = await fetchHistory(validAddress)
+      setNormalTransactionHistory(data.transactions)
+      setHistoryMayHaveMore(data.mayHaveMore)
+
+      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      console.log(
+        `Historical normal transactions loaded: ${data.transactions.length}`,
+        data.transactions,
+      )
+    } catch (err) {
+      setHistoryError('Unable to load historical analysis data')
+    }
+  }
+
   async function loadFirstSeen(validAddress: string) {
     try {
       const data = await fetchFirstSeen(validAddress)
@@ -237,6 +274,9 @@ function App() {
     setWalletDataSource('')
     setTransactions(null)
     setTransactionError('')
+    setNormalTransactionHistory(null)
+    setHistoryMayHaveMore(false)
+    setHistoryError('')
     setFirstSeen(null)
     setFirstSeenChecked(false)
     setFirstSeenError('')
@@ -256,6 +296,7 @@ function App() {
       loadWalletData(address),
       loadTransactions(address),
       loadFirstSeen(address),
+      loadHistory(address),
     ])
 
     setLoading(false)
@@ -275,6 +316,25 @@ function App() {
       }
     } catch (err) {
       setBackendStatus('Unavailable')
+    }
+  }
+
+  // DEV ONLY: a one-line summary of the hidden dataset (count + date range).
+  // The records are sorted newest first, so [0] is newest and the last is oldest.
+  let historySummary = ''
+  if (normalTransactionHistory !== null) {
+    const count = normalTransactionHistory.length
+    if (count === 0) {
+      historySummary = 'Historical analysis data: 0 normal transactions loaded'
+    } else {
+      const newest = new Date(Number(normalTransactionHistory[0].timeStamp) * 1000)
+      const oldest = new Date(
+        Number(normalTransactionHistory[count - 1].timeStamp) * 1000,
+      )
+      historySummary =
+        `Historical analysis data: ${count} normal transactions loaded ` +
+        `(${formatDateTime(oldest)} to ${formatDateTime(newest)})` +
+        (historyMayHaveMore ? ' · window full, older transactions may exist' : '')
     }
   }
 
@@ -345,6 +405,9 @@ function App() {
           Check Backend
         </button>
         {backendStatus && <span>Backend Status: {backendStatus}</span>}
+        {/* DEV ONLY: remove these two lines when Wallet Orbit takes over */}
+        {historySummary && <span>{historySummary}</span>}
+        {historyError && <span>{historyError}</span>}
       </footer>
     </main>
   )
