@@ -8,14 +8,106 @@ const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY
 
 app.use(cors({ origin: 'http://localhost:5173' }))
 
+// DEV ONLY: log how long each request takes. Safe to delete.
+// It only sees requests to OUR server (never Etherscan URLs or API keys),
+// and it replaces wallet addresses with ":address" in the output.
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV === 'production') {
+    return next()
+  }
+
+  const start = Date.now()
+
+  res.on('finish', () => {
+    const safePath = req.path.replace(/0x[a-fA-F0-9]{40}/g, ':address')
+    console.log(
+      `${req.method} ${safePath} — ${Date.now() - start}ms (status ${res.statusCode})`,
+    )
+  })
+
+  next()
+})
+
+// --- Etherscan request scheduler -------------------------------------------
+// Etherscan Free allows about 3 calls per second. Every Etherscan request in
+// this file (including retries) goes through scheduledEtherscanFetch(), which
+// spaces out the START times of requests. It does NOT wait for earlier
+// responses, so requests can still be in flight at the same time.
+
+const ETHERSCAN_MIN_INTERVAL_MS = 550
+let nextEtherscanStartAt = 0
+
+// After an explicit rate-limit response, wait this long before the one retry.
+const ETHERSCAN_RETRY_DELAY_MS = 1200
+
+// DEV ONLY: used to print start times relative to the first request of a burst.
+let burstStartedAt = 0
+
+async function scheduledEtherscanFetch(url) {
+  const now = Date.now()
+
+  // Reserve a start slot. This runs with no `await` before it, so two
+  // requests can never claim the same slot.
+  const startAt = Math.max(now, nextEtherscanStartAt)
+  nextEtherscanStartAt = startAt + ETHERSCAN_MIN_INTERVAL_MS
+
+  const waitMs = startAt - now
+
+  if (waitMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, waitMs))
+  }
+
+  // DEV ONLY: log when the request actually starts (no URL, key or address).
+  // A gap of more than 5 seconds since the last request begins a new burst.
+  if (startAt - burstStartedAt > 5000) {
+    burstStartedAt = startAt
+  }
+  console.log(`Etherscan request started +${startAt - burstStartedAt}ms`)
+
+  return fetch(url)
+}
+
+// True only when Etherscan explicitly says we hit the rate limit.
+// Etherscan reports this with HTTP 200, so we must inspect the JSON.
+function isEtherscanRateLimit(data) {
+  return (
+    data?.status === '0' &&
+    typeof data?.result === 'string' &&
+    data.result.toLowerCase().includes('rate limit')
+  )
+}
+
+// Schedule -> fetch -> parse JSON. If (and only if) Etherscan explicitly
+// reports a rate limit, wait and retry ONCE through the scheduler again.
+async function fetchEtherscanJson(url) {
+  const firstResponse = await scheduledEtherscanFetch(url)
+  const firstData = await firstResponse.json()
+
+  if (!isEtherscanRateLimit(firstData)) {
+    return firstData
+  }
+
+  console.log('Etherscan rate limited — retrying once')
+  await new Promise((resolve) => setTimeout(resolve, ETHERSCAN_RETRY_DELAY_MS))
+
+  // The retry also goes through the scheduler. No further retries after this.
+  const retryResponse = await scheduledEtherscanFetch(url)
+  return retryResponse.json()
+}
+
+// --- Health check ---------------------------------------------------------
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' })
 })
 
+// --- Latest 5 normal transactions -----------------------------------------
+// Kept for compatibility/debugging. The frontend's Analyze flow no longer
+// calls it: the latest 5 now come from the first 5 records of /api/history.
+
 app.get('/api/transactions/:address', async (req, res) => {
   const { address } = req.params
 
-  // Basic check so we don't waste an Etherscan request on a bad address
   if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
     return res.status(400).json({ error: 'Invalid Ethereum address' })
   }
@@ -34,16 +126,16 @@ app.get('/api/transactions/:address', async (req, res) => {
   })
 
   try {
-    const response = await fetch(`https://api.etherscan.io/v2/api?${params}`)
-    const data = await response.json()
+    const data = await fetchEtherscanJson(
+      `https://api.etherscan.io/v2/api?${params}`,
+    )
 
-    // Etherscan returns an array on success (or on "no transactions found")
+    // Etherscan can answer HTTP 200 with an error message in `result`,
+    // so only an array counts as success.
     if (!Array.isArray(data.result)) {
       return res.status(502).json({ error: 'Unable to fetch transactions' })
     }
 
-    // Same single request as before. We just keep more of the fields
-    // Etherscan already sent us, instead of discarding them.
     const transactions = data.result.map((tx) => ({
       hash: tx.hash,
       from: tx.from,
@@ -63,6 +155,8 @@ app.get('/api/transactions/:address', async (req, res) => {
   }
 })
 
+// --- First Seen (normal transactions only, for now) -----------------------
+
 app.get('/api/first-seen/:address', async (req, res) => {
   const { address } = req.params
 
@@ -79,15 +173,15 @@ app.get('/api/first-seen/:address', async (req, res) => {
     endblock: '99999999',
     page: '1',
     offset: '1',
-    sort: 'asc',
+    sort: 'asc', // oldest first
     apikey: ETHERSCAN_API_KEY,
   })
 
   try {
-    const response = await fetch(`https://api.etherscan.io/v2/api?${params}`)
-    const data = await response.json()
+    const data = await fetchEtherscanJson(
+      `https://api.etherscan.io/v2/api?${params}`,
+    )
 
-    // Etherscan returns an array on success (empty if no transactions)
     if (!Array.isArray(data.result)) {
       return res.status(502).json({ error: 'Unable to fetch first seen data' })
     }
@@ -108,10 +202,9 @@ app.get('/api/first-seen/:address', async (req, res) => {
   }
 })
 
-// --- V2.7: historical normal-transaction dataset (for analysis, not UI) ---
+// --- Historical normal-transaction dataset (for analysis, not UI) ---------
 
-// The size of our analysis window. Etherscan allows page * offset <= 10,000,
-// so one request with offset=1000 is allowed. The backend owns this number.
+// Size of our initial normal-transaction analysis window.
 const HISTORY_LIMIT = 1000
 
 app.get('/api/history/:address', async (req, res) => {
@@ -135,16 +228,14 @@ app.get('/api/history/:address', async (req, res) => {
   })
 
   try {
-    const response = await fetch(`https://api.etherscan.io/v2/api?${params}`)
-    const data = await response.json()
+    const data = await fetchEtherscanJson(
+      `https://api.etherscan.io/v2/api?${params}`,
+    )
 
-    // Errors such as a rate limit arrive with HTTP 200 and a text `result`,
-    // so we check the shape ourselves. An empty array is valid (no history).
     if (!Array.isArray(data.result)) {
       return res.status(502).json({ error: 'Unable to fetch transaction history' })
     }
 
-    // Keep the raw fields future relationship analysis will need.
     const transactions = data.result.map((tx) => ({
       hash: tx.hash,
       from: tx.from,
@@ -161,8 +252,7 @@ app.get('/api/history/:address', async (req, res) => {
     res.json({
       transactions,
       requestedLimit: HISTORY_LIMIT,
-      // If we got a full window, the wallet may have older transactions we
-      // did not fetch. This is NOT proof there are more, only that we hit the cap.
+      // Hitting the cap means older transactions MAY exist, not that they do.
       mayHaveMore: transactions.length >= HISTORY_LIMIT,
     })
   } catch (err) {
@@ -170,9 +260,167 @@ app.get('/api/history/:address', async (req, res) => {
   }
 })
 
-// --- V2.4.1: Etherscan emergency fallback for wallet data ---------------
+// --- Historical ERC-20 transfer dataset (for analysis, not UI) ------------
 
-// Small helper used only by the fallback route: one Etherscan V2 request.
+// Size of our initial ERC-20 transfer analysis window.
+const ERC20_LIMIT = 1000
+
+app.get('/api/erc20-history/:address', async (req, res) => {
+  const { address } = req.params
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' })
+  }
+
+  const params = new URLSearchParams({
+    chainid: '1',
+    module: 'account',
+    action: 'tokentx', // ERC-20 token transfer events
+    address,
+    startblock: '0',
+    endblock: '99999999',
+    page: '1',
+    offset: String(ERC20_LIMIT),
+    sort: 'desc', // newest first
+    apikey: ETHERSCAN_API_KEY,
+  })
+
+  try {
+    const data = await fetchEtherscanJson(
+      `https://api.etherscan.io/v2/api?${params}`,
+    )
+
+    if (!Array.isArray(data.result)) {
+      return res.status(502).json({ error: 'Unable to fetch ERC-20 history' })
+    }
+
+    // One record = one token transfer EVENT. The same `hash` can appear
+    // several times, so we do NOT deduplicate by hash.
+    // `value` and `tokenDecimal` stay as strings.
+    const transfers = data.result.map((t) => ({
+      hash: t.hash,
+      blockNumber: t.blockNumber,
+      timeStamp: t.timeStamp,
+      from: t.from,
+      to: t.to,
+      contractAddress: t.contractAddress, // the TOKEN contract, not a recipient
+      value: t.value,
+      tokenName: t.tokenName,
+      tokenSymbol: t.tokenSymbol,
+      tokenDecimal: t.tokenDecimal,
+      transactionIndex: t.transactionIndex,
+      // May be missing from some responses; if so, left out of the JSON.
+      methodId: t.methodId,
+      functionName: t.functionName,
+      statusRep: t.statusRep,
+    }))
+
+    res.json({
+      transfers,
+      requestedLimit: ERC20_LIMIT,
+      mayHaveMore: transfers.length >= ERC20_LIMIT,
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'Unable to fetch ERC-20 history' })
+  }
+})
+
+// --- Historical ERC-721 (NFT) transfer dataset (analysis, not UI) ---------
+
+// Size of our initial ERC-721 transfer analysis window.
+// Reduced from 1000 during debugging; kept at 200 for now.
+const ERC721_LIMIT = 200
+
+app.get('/api/erc721-history/:address', async (req, res) => {
+  const { address } = req.params
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' })
+  }
+
+  const params = new URLSearchParams({
+    chainid: '1',
+    module: 'account',
+    action: 'tokennfttx', // ERC-721 transfer events
+    address,
+    startblock: '0',
+    endblock: '99999999',
+    page: '1',
+    offset: String(ERC721_LIMIT),
+    sort: 'desc', // newest first
+    apikey: ETHERSCAN_API_KEY,
+  })
+
+  try {
+    const data = await fetchEtherscanJson(
+      `https://api.etherscan.io/v2/api?${params}`,
+    )
+
+    if (!Array.isArray(data.result)) {
+      // Log only safe upstream information. Never the URL or the API key.
+      console.error('ERC-721 Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
+
+      // A legitimate "no NFT transfers" answer is a successful empty dataset.
+      const text = `${data.message ?? ''} ${
+        typeof data.result === 'string' ? data.result : ''
+      }`.toLowerCase()
+
+      if (text.includes('no transactions found') || text.includes('no records found')) {
+        return res.json({
+          transfers: [],
+          requestedLimit: ERC721_LIMIT,
+          mayHaveMore: false,
+        })
+      }
+
+      return res.status(502).json({
+        error: 'Unable to fetch ERC-721 history',
+        upstream: {
+          message: data.message,
+          result: typeof data.result === 'string' ? data.result : undefined,
+        },
+      })
+    }
+
+    // One record = one NFT transfer EVENT. The same `hash` can appear several
+    // times, so we do NOT deduplicate by hash. Zero-address from/to values
+    // are kept untouched (mint/burn is interpreted later).
+    const transfers = data.result.map((t) => ({
+      hash: t.hash,
+      blockNumber: t.blockNumber,
+      timeStamp: t.timeStamp,
+      from: t.from,
+      to: t.to,
+      contractAddress: t.contractAddress, // the NFT COLLECTION contract
+      tokenID: t.tokenID, // which NFT inside the collection (string)
+      tokenName: t.tokenName,
+      tokenSymbol: t.tokenSymbol,
+      transactionIndex: t.transactionIndex,
+      // May be missing from some responses; if so, left out of the JSON.
+      methodId: t.methodId,
+      functionName: t.functionName,
+    }))
+
+    res.json({
+      transfers,
+      requestedLimit: ERC721_LIMIT,
+      // Hitting the cap means older transfers MAY exist, not that they do.
+      mayHaveMore: transfers.length >= ERC721_LIMIT,
+    })
+  } catch (err) {
+    console.error('ERC-721 request failed:', err.message)
+    res.status(500).json({ error: 'Unable to fetch ERC-721 history' })
+  }
+})
+
+// --- Etherscan emergency fallback for wallet data -------------------------
+
+// One Etherscan V2 request, used only by the fallback route.
+// It goes through fetchEtherscanJson, so it is scheduled and rate-limit-aware.
 async function callEtherscan(params) {
   const query = new URLSearchParams({
     chainid: '1',
@@ -180,13 +428,7 @@ async function callEtherscan(params) {
     apikey: ETHERSCAN_API_KEY, // stays on the server, never sent to React
   })
 
-  const response = await fetch(`https://api.etherscan.io/v2/api?${query}`)
-
-  if (!response.ok) {
-    throw new Error('Etherscan HTTP error')
-  }
-
-  return response.json()
+  return fetchEtherscanJson(`https://api.etherscan.io/v2/api?${query}`)
 }
 
 // Etherscan's "proxy" endpoints mirror Ethereum JSON-RPC. A good answer has a
@@ -207,9 +449,7 @@ app.get('/api/wallet-fallback/:address', async (req, res) => {
   }
 
   try {
-    // Requests run one after another (not Promise.all) to stay gentle on
-    // Etherscan's per-second rate limit; the app may also be calling
-    // /transactions and /first-seen at the same moment.
+    // Requests run one after another (not Promise.all) inside this route.
 
     // Balance (wei, as a decimal string)
     const balanceData = await callEtherscan({
@@ -245,8 +485,7 @@ app.get('/api/wallet-fallback/:address', async (req, res) => {
       action: 'eth_blockNumber',
     })
 
-    // NORMALIZE: convert everything into plain JSON-safe values.
-    // (BigInt cannot be sent as JSON, so big numbers travel as strings.)
+    // Normalize into JSON-safe values (BigInt cannot be sent as JSON).
     res.json({
       balanceWei: balanceData.result,
       nonce: Number(BigInt(readHexResult(nonceData))),

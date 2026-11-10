@@ -7,7 +7,14 @@ import {
 } from 'viem'
 import { mainnet } from 'viem/chains'
 import './App.css'
-import type { HistoryResponse, Transaction } from './types'
+import type {
+  ERC20HistoryResponse,
+  ERC20Transfer,
+  ERC721HistoryResponse,
+  ERC721Transfer,
+  HistoryResponse,
+  Transaction,
+} from './types'
 import { formatDateTime } from './utils'
 import WalletSummary from './components/WalletSummary'
 import ActivitySummary from './components/ActivitySummary'
@@ -114,16 +121,6 @@ async function getWalletDataFromEtherscanFallback(
   )
 }
 
-async function fetchTransactions(address: string): Promise<Transaction[]> {
-  const response = await fetch(`http://localhost:3001/api/transactions/${address}`)
-
-  if (!response.ok) {
-    throw new Error('Transaction request failed')
-  }
-
-  return response.json()
-}
-
 async function fetchFirstSeen(address: string): Promise<FirstSeenResponse> {
   const response = await fetch(`http://localhost:3001/api/first-seen/${address}`)
 
@@ -134,12 +131,34 @@ async function fetchFirstSeen(address: string): Promise<FirstSeenResponse> {
   return response.json()
 }
 
-// V2.7: the deeper analysis dataset (up to ~1000 normal transactions)
+// Up to ~1000 normal transactions, newest first
 async function fetchHistory(address: string): Promise<HistoryResponse> {
   const response = await fetch(`http://localhost:3001/api/history/${address}`)
 
   if (!response.ok) {
     throw new Error('History request failed')
+  }
+
+  return response.json()
+}
+
+// Up to ~1000 ERC-20 transfer events, newest first
+async function fetchErc20History(address: string): Promise<ERC20HistoryResponse> {
+  const response = await fetch(`http://localhost:3001/api/erc20-history/${address}`)
+
+  if (!response.ok) {
+    throw new Error('ERC-20 history request failed')
+  }
+
+  return response.json()
+}
+
+// Up to ~200 ERC-721 transfer events, newest first
+async function fetchErc721History(address: string): Promise<ERC721HistoryResponse> {
+  const response = await fetch(`http://localhost:3001/api/erc721-history/${address}`)
+
+  if (!response.ok) {
+    throw new Error('ERC-721 history request failed')
   }
 
   return response.json()
@@ -155,17 +174,28 @@ function App() {
   const [blockNumber, setBlockNumber] = useState('')
   // Which source actually supplied the wallet data ('' = none yet)
   const [walletDataSource, setWalletDataSource] = useState<WalletDataSource | ''>('')
-  // RECENT UI data: the latest 5 normal transactions shown as cards.
-  // null = not loaded yet, [] = loaded but empty
-  const [transactions, setTransactions] = useState<Transaction[] | null>(null)
-  const [transactionError, setTransactionError] = useState('')
-  // ANALYSIS data: up to ~1000 normal transactions, kept in memory, NEVER rendered.
+  // ANALYSIS data: up to ~1000 normal transactions (Ethereum transaction-level
+  // activity). The Recent Transactions UI is DERIVED from this (see below).
   // null = not loaded yet
   const [normalTransactionHistory, setNormalTransactionHistory] =
     useState<Transaction[] | null>(null)
   // true if the window was full, so older transactions may exist
   const [historyMayHaveMore, setHistoryMayHaveMore] = useState(false)
   const [historyError, setHistoryError] = useState('')
+  // ANALYSIS data: up to ~1000 ERC-20 transfer EVENTS (fungible token movement).
+  // Kept separate from normal transactions on purpose. Never rendered.
+  // null = not loaded yet
+  const [erc20TransferHistory, setErc20TransferHistory] =
+    useState<ERC20Transfer[] | null>(null)
+  const [erc20MayHaveMore, setErc20MayHaveMore] = useState(false)
+  const [erc20Error, setErc20Error] = useState('')
+  // ANALYSIS data: up to ~200 ERC-721 transfer EVENTS (unique NFT movement).
+  // Separate from the other two datasets on purpose. Never rendered.
+  // null = not loaded yet
+  const [erc721TransferHistory, setErc721TransferHistory] =
+    useState<ERC721Transfer[] | null>(null)
+  const [erc721MayHaveMore, setErc721MayHaveMore] = useState(false)
+  const [erc721Error, setErc721Error] = useState('')
   // null = not loaded yet
   const [firstSeen, setFirstSeen] = useState<Date | null>(null)
   const [firstSeenChecked, setFirstSeenChecked] = useState(false)
@@ -174,11 +204,15 @@ function App() {
   const [error, setError] = useState('')
   const [backendStatus, setBackendStatus] = useState('')
 
-  // Last Active comes from the newest transaction we already fetched.
-  // The backend returns transactions newest first, so index 0 is the latest.
+  // DERIVED, not fetched: the history is newest-first, so its first 5 records
+  // ARE the latest 5 transactions. No separate request, no separate state.
+  const recentTransactions =
+    normalTransactionHistory !== null ? normalTransactionHistory.slice(0, 5) : null
+
+  // Last Active comes from the newest transaction (index 0).
   const lastActive =
-    transactions !== null && transactions.length > 0
-      ? new Date(Number(transactions[0].timeStamp) * 1000)
+    recentTransactions !== null && recentTransactions.length > 0
+      ? new Date(Number(recentTransactions[0].timeStamp) * 1000)
       : null
 
   // Copies normalized wallet data into React state. It doesn't care
@@ -225,16 +259,8 @@ function App() {
     setError('Unable to fetch wallet data')
   }
 
-  async function loadTransactions(validAddress: string) {
-    try {
-      const recentTransactions = await fetchTransactions(validAddress)
-      setTransactions(recentTransactions)
-    } catch (err) {
-      setTransactionError('Unable to fetch transaction history')
-    }
-  }
-
-  // V2.7: has its own try/catch, so a failure here cannot affect any other feature.
+  // Has its own try/catch, so a failure here cannot affect other features
+  // (except the Recent Transactions card, which is derived from this data).
   async function loadHistory(validAddress: string) {
     try {
       const data = await fetchHistory(validAddress)
@@ -248,6 +274,40 @@ function App() {
       )
     } catch (err) {
       setHistoryError('Unable to load historical analysis data')
+    }
+  }
+
+  // Its own try/catch. An ERC-20 failure touches nothing else.
+  async function loadErc20History(validAddress: string) {
+    try {
+      const data = await fetchErc20History(validAddress)
+      setErc20TransferHistory(data.transfers)
+      setErc20MayHaveMore(data.mayHaveMore)
+
+      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      console.log(
+        `ERC-20 transfers loaded: ${data.transfers.length}`,
+        data.transfers,
+      )
+    } catch (err) {
+      setErc20Error('Unable to load ERC-20 analysis data')
+    }
+  }
+
+  // Its own try/catch. An ERC-721 failure touches nothing else.
+  async function loadErc721History(validAddress: string) {
+    try {
+      const data = await fetchErc721History(validAddress)
+      setErc721TransferHistory(data.transfers)
+      setErc721MayHaveMore(data.mayHaveMore)
+
+      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      console.log(
+        `ERC-721 transfers loaded: ${data.transfers.length}`,
+        data.transfers,
+      )
+    } catch (err) {
+      setErc721Error('Unable to load ERC-721 analysis data')
     }
   }
 
@@ -272,11 +332,15 @@ function App() {
     setAccountType('')
     setBlockNumber('')
     setWalletDataSource('')
-    setTransactions(null)
-    setTransactionError('')
     setNormalTransactionHistory(null)
     setHistoryMayHaveMore(false)
     setHistoryError('')
+    setErc20TransferHistory(null)
+    setErc20MayHaveMore(false)
+    setErc20Error('')
+    setErc721TransferHistory(null)
+    setErc721MayHaveMore(false)
+    setErc721Error('')
     setFirstSeen(null)
     setFirstSeenChecked(false)
     setFirstSeenError('')
@@ -290,13 +354,16 @@ function App() {
     setAnalyzedAddress(address)
     setLoading(true)
 
-    // Each function handles its own errors, so one failing
-    // does not break the others. They still run at the same time.
+    // All loaders start together. Each one handles its own errors, so one
+    // failing does not break the others. The BACKEND spaces out the start
+    // times of Etherscan requests, so the frontend does not need to care
+    // about Etherscan's rate limit.
     await Promise.all([
       loadWalletData(address),
-      loadTransactions(address),
-      loadFirstSeen(address),
       loadHistory(address),
+      loadFirstSeen(address),
+      loadErc20History(address),
+      loadErc721History(address),
     ])
 
     setLoading(false)
@@ -319,8 +386,8 @@ function App() {
     }
   }
 
-  // DEV ONLY: a one-line summary of the hidden dataset (count + date range).
-  // The records are sorted newest first, so [0] is newest and the last is oldest.
+  // DEV ONLY: a one-line summary of the hidden normal-transaction dataset.
+  // Records are newest first, so [0] is newest and the last is oldest.
   let historySummary = ''
   if (normalTransactionHistory !== null) {
     const count = normalTransactionHistory.length
@@ -335,6 +402,52 @@ function App() {
         `Historical analysis data: ${count} normal transactions loaded ` +
         `(${formatDateTime(oldest)} to ${formatDateTime(newest)})` +
         (historyMayHaveMore ? ' · window full, older transactions may exist' : '')
+    }
+  }
+
+  // DEV ONLY: the same kind of summary for the hidden ERC-20 dataset.
+  let erc20Summary = ''
+  if (erc20TransferHistory !== null) {
+    const count = erc20TransferHistory.length
+    if (count === 0) {
+      erc20Summary = 'ERC-20 analysis data: 0 transfers loaded'
+    } else {
+      const newest = new Date(Number(erc20TransferHistory[0].timeStamp) * 1000)
+      const oldest = new Date(
+        Number(erc20TransferHistory[count - 1].timeStamp) * 1000,
+      )
+      // A few distinct token symbols, just so we can see what is in there
+      const symbols = [...new Set(erc20TransferHistory.map((t) => t.tokenSymbol))]
+      const symbolText =
+        symbols.slice(0, 5).join(', ') + (symbols.length > 5 ? ', ...' : '')
+
+      erc20Summary =
+        `ERC-20 analysis data: ${count} transfers loaded ` +
+        `(${formatDateTime(oldest)} to ${formatDateTime(newest)}; ${symbolText})` +
+        (erc20MayHaveMore ? ' · window full, older transfers may exist' : '')
+    }
+  }
+
+  // DEV ONLY: the same kind of summary for the hidden ERC-721 dataset.
+  let erc721Summary = ''
+  if (erc721TransferHistory !== null) {
+    const count = erc721TransferHistory.length
+    if (count === 0) {
+      erc721Summary = 'ERC-721 analysis data: 0 transfers loaded'
+    } else {
+      const newest = new Date(Number(erc721TransferHistory[0].timeStamp) * 1000)
+      const oldest = new Date(
+        Number(erc721TransferHistory[count - 1].timeStamp) * 1000,
+      )
+      // A few distinct collection names, just so we can see what is in there
+      const collections = [...new Set(erc721TransferHistory.map((t) => t.tokenName))]
+      const collectionText =
+        collections.slice(0, 5).join(', ') + (collections.length > 5 ? ', ...' : '')
+
+      erc721Summary =
+        `ERC-721 analysis data: ${count} transfers loaded ` +
+        `(${formatDateTime(oldest)} to ${formatDateTime(newest)}; ${collectionText})` +
+        (erc721MayHaveMore ? ' · window full, older transfers may exist' : '')
     }
   }
 
@@ -393,8 +506,10 @@ function App() {
           />
 
           <TransactionList
-            transactions={transactions}
-            transactionError={transactionError}
+            transactions={recentTransactions}
+            transactionError={
+              historyError ? 'Unable to fetch transaction history' : ''
+            }
             analyzedAddress={analyzedAddress}
           />
         </>
@@ -405,9 +520,13 @@ function App() {
           Check Backend
         </button>
         {backendStatus && <span>Backend Status: {backendStatus}</span>}
-        {/* DEV ONLY: remove these two lines when Wallet Orbit takes over */}
+        {/* DEV ONLY: remove these lines when Wallet Orbit takes over */}
         {historySummary && <span>{historySummary}</span>}
         {historyError && <span>{historyError}</span>}
+        {erc20Summary && <span>{erc20Summary}</span>}
+        {erc20Error && <span>{erc20Error}</span>}
+        {erc721Summary && <span>{erc721Summary}</span>}
+        {erc721Error && <span>{erc721Error}</span>}
       </footer>
     </main>
   )
