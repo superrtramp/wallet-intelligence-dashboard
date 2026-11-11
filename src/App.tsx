@@ -8,11 +8,15 @@ import {
 import { mainnet } from 'viem/chains'
 import './App.css'
 import type {
+  ERC1155HistoryResponse,
+  ERC1155Transfer,
   ERC20HistoryResponse,
   ERC20Transfer,
   ERC721HistoryResponse,
   ERC721Transfer,
   HistoryResponse,
+  InternalHistoryResponse,
+  InternalTransaction,
   Transaction,
 } from './types'
 import { formatDateTime } from './utils'
@@ -164,6 +168,28 @@ async function fetchErc721History(address: string): Promise<ERC721HistoryRespons
   return response.json()
 }
 
+// Up to ~200 ERC-1155 transfer records, newest first
+async function fetchErc1155History(address: string): Promise<ERC1155HistoryResponse> {
+  const response = await fetch(`http://localhost:3001/api/erc1155-history/${address}`)
+
+  if (!response.ok) {
+    throw new Error('ERC-1155 history request failed')
+  }
+
+  return response.json()
+}
+
+// Up to ~1000 internal transaction records, newest first
+async function fetchInternalHistory(address: string): Promise<InternalHistoryResponse> {
+  const response = await fetch(`http://localhost:3001/api/internal-history/${address}`)
+
+  if (!response.ok) {
+    throw new Error('Internal history request failed')
+  }
+
+  return response.json()
+}
+
 function App() {
   const [address, setAddress] = useState('')
   // The address that was actually analyzed (the input box can change afterwards)
@@ -190,12 +216,27 @@ function App() {
   const [erc20MayHaveMore, setErc20MayHaveMore] = useState(false)
   const [erc20Error, setErc20Error] = useState('')
   // ANALYSIS data: up to ~200 ERC-721 transfer EVENTS (unique NFT movement).
-  // Separate from the other two datasets on purpose. Never rendered.
+  // Separate from the other datasets on purpose. Never rendered.
   // null = not loaded yet
   const [erc721TransferHistory, setErc721TransferHistory] =
     useState<ERC721Transfer[] | null>(null)
   const [erc721MayHaveMore, setErc721MayHaveMore] = useState(false)
   const [erc721Error, setErc721Error] = useState('')
+  // ANALYSIS data: up to ~200 ERC-1155 transfer RECORDS (multi-token movement).
+  // Separate from the other datasets on purpose. Never rendered.
+  // null = not loaded yet
+  const [erc1155TransferHistory, setErc1155TransferHistory] =
+    useState<ERC1155Transfer[] | null>(null)
+  const [erc1155MayHaveMore, setErc1155MayHaveMore] = useState(false)
+  const [erc1155Error, setErc1155Error] = useState('')
+  // ANALYSIS data: up to ~1000 INTERNAL transaction records (value movement
+  // and calls produced during contract execution). Separate from every other
+  // dataset on purpose. Never rendered.
+  // null = not loaded yet
+  const [internalTransactionHistory, setInternalTransactionHistory] =
+    useState<InternalTransaction[] | null>(null)
+  const [internalMayHaveMore, setInternalMayHaveMore] = useState(false)
+  const [internalError, setInternalError] = useState('')
   // null = not loaded yet
   const [firstSeen, setFirstSeen] = useState<Date | null>(null)
   const [firstSeenChecked, setFirstSeenChecked] = useState(false)
@@ -311,6 +352,40 @@ function App() {
     }
   }
 
+  // Its own try/catch. An ERC-1155 failure touches nothing else.
+  async function loadErc1155History(validAddress: string) {
+    try {
+      const data = await fetchErc1155History(validAddress)
+      setErc1155TransferHistory(data.transfers)
+      setErc1155MayHaveMore(data.mayHaveMore)
+
+      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      console.log(
+        `ERC-1155 transfers loaded: ${data.transfers.length}`,
+        data.transfers,
+      )
+    } catch (err) {
+      setErc1155Error('Unable to load ERC-1155 analysis data')
+    }
+  }
+
+  // Its own try/catch. An internal-history failure touches nothing else.
+  async function loadInternalHistory(validAddress: string) {
+    try {
+      const data = await fetchInternalHistory(validAddress)
+      setInternalTransactionHistory(data.transactions)
+      setInternalMayHaveMore(data.mayHaveMore)
+
+      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      console.log(
+        `Internal transactions loaded: ${data.transactions.length}`,
+        data.transactions,
+      )
+    } catch (err) {
+      setInternalError('Unable to load internal transaction analysis data')
+    }
+  }
+
   async function loadFirstSeen(validAddress: string) {
     try {
       const data = await fetchFirstSeen(validAddress)
@@ -341,6 +416,12 @@ function App() {
     setErc721TransferHistory(null)
     setErc721MayHaveMore(false)
     setErc721Error('')
+    setErc1155TransferHistory(null)
+    setErc1155MayHaveMore(false)
+    setErc1155Error('')
+    setInternalTransactionHistory(null)
+    setInternalMayHaveMore(false)
+    setInternalError('')
     setFirstSeen(null)
     setFirstSeenChecked(false)
     setFirstSeenError('')
@@ -364,6 +445,8 @@ function App() {
       loadFirstSeen(address),
       loadErc20History(address),
       loadErc721History(address),
+      loadErc1155History(address),
+      loadInternalHistory(address),
     ])
 
     setLoading(false)
@@ -451,6 +534,42 @@ function App() {
     }
   }
 
+  // DEV ONLY: the same kind of summary for the hidden ERC-1155 dataset.
+  let erc1155Summary = ''
+  if (erc1155TransferHistory !== null) {
+    const count = erc1155TransferHistory.length
+    if (count === 0) {
+      erc1155Summary = 'ERC-1155 analysis data: 0 transfers loaded'
+    } else {
+      const newest = new Date(Number(erc1155TransferHistory[0].timeStamp) * 1000)
+      const oldest = new Date(
+        Number(erc1155TransferHistory[count - 1].timeStamp) * 1000,
+      )
+      erc1155Summary =
+        `ERC-1155 analysis data: ${count} transfers loaded ` +
+        `(${formatDateTime(oldest)} to ${formatDateTime(newest)})` +
+        (erc1155MayHaveMore ? ' · window full, older transfers may exist' : '')
+    }
+  }
+
+  // DEV ONLY: the same kind of summary for the hidden internal-tx dataset.
+  let internalSummary = ''
+  if (internalTransactionHistory !== null) {
+    const count = internalTransactionHistory.length
+    if (count === 0) {
+      internalSummary = 'Internal transaction analysis data: 0 records loaded'
+    } else {
+      const newest = new Date(Number(internalTransactionHistory[0].timeStamp) * 1000)
+      const oldest = new Date(
+        Number(internalTransactionHistory[count - 1].timeStamp) * 1000,
+      )
+      internalSummary =
+        `Internal transaction analysis data: ${count} records loaded ` +
+        `(${formatDateTime(oldest)} to ${formatDateTime(newest)})` +
+        (internalMayHaveMore ? ' · window full, older records may exist' : '')
+    }
+  }
+
   // App.tsx owns the state and logic. Below, it only hands data
   // to presentation components through props.
   return (
@@ -527,6 +646,10 @@ function App() {
         {erc20Error && <span>{erc20Error}</span>}
         {erc721Summary && <span>{erc721Summary}</span>}
         {erc721Error && <span>{erc721Error}</span>}
+        {erc1155Summary && <span>{erc1155Summary}</span>}
+        {erc1155Error && <span>{erc1155Error}</span>}
+        {internalSummary && <span>{internalSummary}</span>}
+        {internalError && <span>{internalError}</span>}
       </footer>
     </main>
   )

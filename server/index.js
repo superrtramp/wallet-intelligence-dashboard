@@ -417,6 +417,185 @@ app.get('/api/erc721-history/:address', async (req, res) => {
   }
 })
 
+// --- Historical ERC-1155 (multi-token) transfer dataset (analysis, not UI) -
+
+// Size of our initial ERC-1155 transfer analysis window.
+const ERC1155_LIMIT = 200
+
+app.get('/api/erc1155-history/:address', async (req, res) => {
+  const { address } = req.params
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' })
+  }
+
+  const params = new URLSearchParams({
+    chainid: '1',
+    module: 'account',
+    action: 'token1155tx', // ERC-1155 transfer events
+    address,
+    startblock: '0',
+    endblock: '99999999',
+    page: '1',
+    offset: String(ERC1155_LIMIT),
+    sort: 'desc', // newest first
+    apikey: ETHERSCAN_API_KEY,
+  })
+
+  try {
+    // Same shared gateway as every other Etherscan request: scheduled,
+    // rate-limit-aware, one retry.
+    const data = await fetchEtherscanJson(
+      `https://api.etherscan.io/v2/api?${params}`,
+    )
+
+    if (!Array.isArray(data.result)) {
+      // Log only safe upstream information. Never the URL or the API key.
+      console.error('ERC-1155 Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
+
+      // A legitimate "no transfers" answer is a successful empty dataset.
+      const text = `${data.message ?? ''} ${
+        typeof data.result === 'string' ? data.result : ''
+      }`.toLowerCase()
+
+      if (text.includes('no transactions found') || text.includes('no records found')) {
+        return res.json({
+          transfers: [],
+          requestedLimit: ERC1155_LIMIT,
+          mayHaveMore: false,
+        })
+      }
+
+      return res.status(502).json({ error: 'Unable to fetch ERC-1155 history' })
+    }
+
+    // One record = one ERC-1155 transfer entry. A batch transaction can
+    // produce several records with the same `hash`, so we do NOT deduplicate
+    // or combine them. tokenID and tokenValue stay as strings. Zero-address
+    // from/to values are kept untouched (mint/burn is interpreted later).
+    const transfers = data.result.map((t) => ({
+      hash: t.hash,
+      blockNumber: t.blockNumber,
+      timeStamp: t.timeStamp,
+      from: t.from,
+      to: t.to,
+      contractAddress: t.contractAddress, // the ERC-1155 contract
+      tokenID: t.tokenID, // which token inside the contract
+      tokenValue: t.tokenValue, // how many units of that token moved
+      tokenName: t.tokenName,
+      tokenSymbol: t.tokenSymbol,
+      transactionIndex: t.transactionIndex,
+      // May be missing from some responses; if so, left out of the JSON.
+      methodId: t.methodId,
+      functionName: t.functionName,
+    }))
+
+    res.json({
+      transfers,
+      requestedLimit: ERC1155_LIMIT,
+      // Only means the returned count reached our configured limit.
+      mayHaveMore: transfers.length >= ERC1155_LIMIT,
+    })
+  } catch (err) {
+    console.error('ERC-1155 request failed:', err.message)
+    res.status(500).json({ error: 'Unable to fetch ERC-1155 history' })
+  }
+})
+
+// --- Historical internal-transaction dataset (for analysis, not UI) -------
+
+// Size of our initial internal-transaction analysis window.
+const INTERNAL_LIMIT = 1000
+
+app.get('/api/internal-history/:address', async (req, res) => {
+  const { address } = req.params
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' })
+  }
+
+  const params = new URLSearchParams({
+    chainid: '1',
+    module: 'account',
+    action: 'txlistinternal', // internal transactions (from execution traces)
+    address,
+    startblock: '0',
+    endblock: '99999999',
+    page: '1',
+    offset: String(INTERNAL_LIMIT),
+    sort: 'desc', // newest first
+    apikey: ETHERSCAN_API_KEY,
+  })
+
+  try {
+    // Same shared gateway as every other Etherscan request: scheduled,
+    // rate-limit-aware, one retry.
+    const data = await fetchEtherscanJson(
+      `https://api.etherscan.io/v2/api?${params}`,
+    )
+
+    if (!Array.isArray(data.result)) {
+      // Log only safe upstream information. Never the URL or the API key.
+      console.error('Internal-tx Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
+
+      // A legitimate "no internal transactions" answer is a successful
+      // empty dataset.
+      const text = `${data.message ?? ''} ${
+        typeof data.result === 'string' ? data.result : ''
+      }`.toLowerCase()
+
+      if (text.includes('no transactions found') || text.includes('no records found')) {
+        return res.json({
+          transactions: [],
+          requestedLimit: INTERNAL_LIMIT,
+          mayHaveMore: false,
+        })
+      }
+
+      return res.status(502).json({ error: 'Unable to fetch internal history' })
+    }
+
+    // One record = one internal operation. Several records can share one
+    // `hash`; `traceId` tells them apart. We do NOT deduplicate or merge.
+    // All numeric values stay as strings. Empty `to` / `contractAddress`
+    // values are kept exactly as returned.
+    const transactions = data.result.map((t) => ({
+      blockNumber: t.blockNumber,
+      timeStamp: t.timeStamp,
+      hash: t.hash,
+      from: t.from,
+      to: t.to,
+      value: t.value, // native ETH in wei
+      contractAddress: t.contractAddress,
+      input: t.input,
+      type: t.type,
+      gas: t.gas,
+      gasUsed: t.gasUsed,
+      traceId: t.traceId,
+      isError: t.isError,
+      errCode: t.errCode,
+    }))
+
+    res.json({
+      transactions,
+      requestedLimit: INTERNAL_LIMIT,
+      // Only means the returned count reached our configured limit.
+      mayHaveMore: transactions.length >= INTERNAL_LIMIT,
+    })
+  } catch (err) {
+    console.error('Internal-tx request failed:', err.message)
+    res.status(500).json({ error: 'Unable to fetch internal history' })
+  }
+})
+
 // --- Etherscan emergency fallback for wallet data -------------------------
 
 // One Etherscan V2 request, used only by the fallback route.
