@@ -135,3 +135,35 @@ export function buildUnifiedActivities(
   // Newest first. Order within the same timestamp is not meaningful yet.
   return activities.sort((a, b) => Number(b.timeStamp) - Number(a.timeStamp))
 }
+
+// --- V2.8: Last Observed Activity ------------------------------------------
+
+export type LastObservedActivity = {
+  timeStamp: string // Unix seconds, as a string
+  hash: string
+  // Unique source labels of every activity tied at the latest timestamp.
+  sourceLabels: string[]
+}
+
+// The latest activity across ALL five source types. No request needed:
+// Activity[] is already sorted newest first, so [0] is the latest.
+// ONLY call this with a COMPLETE Activity[] (see unifiedActivityComplete).
+export function getLastObservedActivity(
+  activities: Activity[],
+): LastObservedActivity | null {
+  if (activities.length === 0) {
+    return null
+  }
+
+  const latest = activities[0]
+
+  // Keep every source that shares the exact latest timestamp (explainability).
+  const tied = activities.filter((a) => a.timeStamp === latest.timeStamp)
+  const sourceLabels = [...new Set(tied.map((a) => a.sourceLabel))]
+
+  return {
+    timeStamp: latest.timeStamp,
+    hash: latest.hash,
+    sourceLabels,
+  }
+}

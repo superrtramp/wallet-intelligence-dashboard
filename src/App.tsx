@@ -21,11 +21,12 @@ import type {
   InternalTransaction,
   Transaction,
 } from './types'
-import { buildUnifiedActivities } from './activity'
+import { buildUnifiedActivities, getLastObservedActivity } from './activity'
+import { buildOrbitItems } from './orbit'
 import { formatDateTime } from './utils'
 import WalletSummary from './components/WalletSummary'
 import ActivitySummary from './components/ActivitySummary'
-import TransactionList from './components/TransactionList'
+import WalletOrbit from './components/WalletOrbit'
 
 // --- RPC configuration -------------------------------------------------
 // Vite exposes only variables starting with VITE_ to frontend code.
@@ -122,7 +123,7 @@ async function getWalletDataFromEtherscanFallback(
   )
 }
 
-// V2.7.4: ONE request to our backend. The backend internally performs five
+// ONE request to our backend. The backend internally performs five
 // scheduled Etherscan lookups; the frontend neither knows nor cares.
 async function fetchFirstObserved(address: string): Promise<FirstObservedResponse> {
   const response = await fetch(`http://localhost:3001/api/first-observed/${address}`)
@@ -200,37 +201,36 @@ function App() {
   // Which source actually supplied the wallet data ('' = none yet)
   const [walletDataSource, setWalletDataSource] = useState<WalletDataSource | ''>('')
 
-  // --- RAW datasets. They stay separate and intact. Never rendered. ---
-  // ANALYSIS data: up to ~1000 normal transactions. The Recent Transactions
-  // UI is DERIVED from this (see below). null = not loaded yet
+  // --- RAW datasets. They stay separate and intact. ---
+  // THE KEY DISTINCTION, for all five:
+  //   null = NOT successfully available (still loading, or really failed)
+  //   []   = successfully checked, zero records ("No activity found")
   const [normalTransactionHistory, setNormalTransactionHistory] =
     useState<Transaction[] | null>(null)
-  // true if the window was full, so older transactions may exist
   const [historyMayHaveMore, setHistoryMayHaveMore] = useState(false)
   const [historyError, setHistoryError] = useState('')
-  // Up to ~1000 ERC-20 transfer EVENTS (fungible token movement)
+
   const [erc20TransferHistory, setErc20TransferHistory] =
     useState<ERC20Transfer[] | null>(null)
   const [erc20MayHaveMore, setErc20MayHaveMore] = useState(false)
   const [erc20Error, setErc20Error] = useState('')
-  // Up to ~200 ERC-721 transfer EVENTS (unique NFT movement)
+
   const [erc721TransferHistory, setErc721TransferHistory] =
     useState<ERC721Transfer[] | null>(null)
   const [erc721MayHaveMore, setErc721MayHaveMore] = useState(false)
   const [erc721Error, setErc721Error] = useState('')
-  // Up to ~200 ERC-1155 transfer RECORDS (multi-token movement)
+
   const [erc1155TransferHistory, setErc1155TransferHistory] =
     useState<ERC1155Transfer[] | null>(null)
   const [erc1155MayHaveMore, setErc1155MayHaveMore] = useState(false)
   const [erc1155Error, setErc1155Error] = useState('')
-  // Up to ~1000 INTERNAL transaction records (contract execution traces)
+
   const [internalTransactionHistory, setInternalTransactionHistory] =
     useState<InternalTransaction[] | null>(null)
   const [internalMayHaveMore, setInternalMayHaveMore] = useState(false)
   const [internalError, setInternalError] = useState('')
 
   // First Observed Activity: earliest activity across all five sources.
-  // firstObservedChecked separates "looked, found nothing" from "not loaded yet".
   const [firstObserved, setFirstObserved] = useState<FirstObservedActivity | null>(null)
   const [firstObservedChecked, setFirstObservedChecked] = useState(false)
   const [firstObservedError, setFirstObservedError] = useState('')
@@ -239,20 +239,9 @@ function App() {
   const [error, setError] = useState('')
   const [backendStatus, setBackendStatus] = useState('')
 
-  // DERIVED, not fetched: the history is newest-first, so its first 5 records
-  // ARE the latest 5 transactions. No separate request, no separate state.
-  const recentTransactions =
-    normalTransactionHistory !== null ? normalTransactionHistory.slice(0, 5) : null
-
-  // Last Active comes from the newest transaction (index 0).
-  const lastActive =
-    recentTransactions !== null && recentTransactions.length > 0
-      ? new Date(Number(recentTransactions[0].timeStamp) * 1000)
-      : null
-
-  // DERIVED: the unified Activity[] is rebuilt from the five raw datasets
-  // whenever any of them changes. A dataset that has not loaded (or failed)
-  // simply contributes nothing.
+  // DERIVED: Activity[] is rebuilt from the five raw datasets whenever any of
+  // them changes. A missing (null) dataset contributes nothing here, which is
+  // exactly why completeness is checked separately below.
   const unifiedActivities = useMemo(
     () =>
       buildUnifiedActivities(
@@ -271,25 +260,44 @@ function App() {
     ],
   )
 
-  // DEV ONLY: log the unified array once all five raw datasets have arrived.
+  // COMPLETENESS: true only when all five sources successfully resolved.
+  // A valid empty array ([]) counts as resolved. null does not.
+  const unifiedActivityComplete =
+    normalTransactionHistory !== null &&
+    erc20TransferHistory !== null &&
+    erc721TransferHistory !== null &&
+    erc1155TransferHistory !== null &&
+    internalTransactionHistory !== null
+
+  // Which sources REALLY failed (an error was recorded), for display.
+  const failedSources: string[] = []
+  if (historyError) failedSources.push('Normal transactions')
+  if (erc20Error) failedSources.push('ERC-20')
+  if (erc721Error) failedSources.push('ERC-721')
+  if (erc1155Error) failedSources.push('ERC-1155')
+  if (internalError) failedSources.push('Internal')
+
+  // LAST OBSERVED: from ALL five source types, but ONLY when complete.
+  // Zero extra requests: Activity[] is already newest first.
+  const lastObserved = useMemo(
+    () => (unifiedActivityComplete ? getLastObservedActivity(unifiedActivities) : null),
+    [unifiedActivityComplete, unifiedActivities],
+  )
+
+  // ORBIT: Activity[] -> orbit items (newest 25). Only built when complete.
+  // No fetch anywhere on this path.
+  const orbitItems = useMemo(
+    () =>
+      unifiedActivityComplete ? buildOrbitItems(unifiedActivities, analyzedAddress) : [],
+    [unifiedActivityComplete, unifiedActivities, analyzedAddress],
+  )
+
+  // DEV ONLY: log the unified array once the data is complete.
   useEffect(() => {
-    if (
-      normalTransactionHistory !== null &&
-      erc20TransferHistory !== null &&
-      erc721TransferHistory !== null &&
-      erc1155TransferHistory !== null &&
-      internalTransactionHistory !== null
-    ) {
+    if (unifiedActivityComplete) {
       console.log(`Unified activities: ${unifiedActivities.length}`, unifiedActivities)
     }
-  }, [
-    unifiedActivities,
-    normalTransactionHistory,
-    erc20TransferHistory,
-    erc721TransferHistory,
-    erc1155TransferHistory,
-    internalTransactionHistory,
-  ])
+  }, [unifiedActivityComplete, unifiedActivities])
 
   // Copies normalized wallet data into React state. It doesn't care
   // which provider produced the data, only which label to show.
@@ -335,8 +343,9 @@ function App() {
     setError('Unable to fetch wallet data')
   }
 
-  // Has its own try/catch, so a failure here cannot affect other features
-  // (except the Recent Transactions card, which is derived from this data).
+  // Each loader has its own try/catch. On success the state becomes an array
+  // (possibly empty). On failure the state STAYS null and an error is recorded.
+  // A failed source is never converted into [].
   async function loadHistory(validAddress: string) {
     try {
       const data = await fetchHistory(validAddress)
@@ -353,14 +362,13 @@ function App() {
     }
   }
 
-  // Its own try/catch. An ERC-20 failure touches nothing else.
   async function loadErc20History(validAddress: string) {
     try {
       const data = await fetchErc20History(validAddress)
       setErc20TransferHistory(data.transfers)
       setErc20MayHaveMore(data.mayHaveMore)
 
-      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      // DEV ONLY
       console.log(
         `ERC-20 transfers loaded: ${data.transfers.length}`,
         data.transfers,
@@ -370,14 +378,13 @@ function App() {
     }
   }
 
-  // Its own try/catch. An ERC-721 failure touches nothing else.
   async function loadErc721History(validAddress: string) {
     try {
       const data = await fetchErc721History(validAddress)
       setErc721TransferHistory(data.transfers)
       setErc721MayHaveMore(data.mayHaveMore)
 
-      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      // DEV ONLY
       console.log(
         `ERC-721 transfers loaded: ${data.transfers.length}`,
         data.transfers,
@@ -387,14 +394,13 @@ function App() {
     }
   }
 
-  // Its own try/catch. An ERC-1155 failure touches nothing else.
   async function loadErc1155History(validAddress: string) {
     try {
       const data = await fetchErc1155History(validAddress)
       setErc1155TransferHistory(data.transfers)
       setErc1155MayHaveMore(data.mayHaveMore)
 
-      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      // DEV ONLY
       console.log(
         `ERC-1155 transfers loaded: ${data.transfers.length}`,
         data.transfers,
@@ -404,14 +410,13 @@ function App() {
     }
   }
 
-  // Its own try/catch. An internal-history failure touches nothing else.
   async function loadInternalHistory(validAddress: string) {
     try {
       const data = await fetchInternalHistory(validAddress)
       setInternalTransactionHistory(data.transactions)
       setInternalMayHaveMore(data.mayHaveMore)
 
-      // DEV ONLY: inspect the array in the browser console. Safe to delete.
+      // DEV ONLY
       console.log(
         `Internal transactions loaded: ${data.transactions.length}`,
         data.transactions,
@@ -421,8 +426,8 @@ function App() {
     }
   }
 
-  // Its own try/catch. If the backend could not determine First Observed
-  // Activity reliably, we show an error instead of a possibly wrong date.
+  // If the backend could not determine First Observed Activity reliably, we
+  // show an error instead of a possibly wrong date.
   async function loadFirstObserved(validAddress: string) {
     try {
       const data = await fetchFirstObserved(validAddress)
@@ -468,10 +473,8 @@ function App() {
     setAnalyzedAddress(address)
     setLoading(true)
 
-    // All loaders start together. Each one handles its own errors, so one
-    // failing does not break the others. The BACKEND spaces out the start
-    // times of Etherscan requests, so the frontend does not need to care
-    // about Etherscan's rate limit.
+    // All loaders start together. Each one handles its own errors. The
+    // BACKEND spaces out the start times of Etherscan requests.
     await Promise.all([
       loadWalletData(address),
       loadHistory(address),
@@ -502,13 +505,16 @@ function App() {
     }
   }
 
-  // DEV ONLY: a one-line summary of the hidden normal-transaction dataset.
-  // Records are newest first, so [0] is newest and the last is oldest.
+  // --- DEV ONLY status lines. Three meanings stay distinct: ---
+  //   records loaded   -> count + date range
+  //   loaded, empty    -> "No activity found"
+  //   real failure     -> "Failed"  (rendered in the footer below)
+
   let historySummary = ''
   if (normalTransactionHistory !== null) {
     const count = normalTransactionHistory.length
     if (count === 0) {
-      historySummary = 'Historical analysis data: 0 normal transactions loaded'
+      historySummary = 'Normal transactions: No activity found'
     } else {
       const newest = new Date(Number(normalTransactionHistory[0].timeStamp) * 1000)
       const oldest = new Date(
@@ -521,18 +527,16 @@ function App() {
     }
   }
 
-  // DEV ONLY: the same kind of summary for the hidden ERC-20 dataset.
   let erc20Summary = ''
   if (erc20TransferHistory !== null) {
     const count = erc20TransferHistory.length
     if (count === 0) {
-      erc20Summary = 'ERC-20 analysis data: 0 transfers loaded'
+      erc20Summary = 'ERC-20: No activity found'
     } else {
       const newest = new Date(Number(erc20TransferHistory[0].timeStamp) * 1000)
       const oldest = new Date(
         Number(erc20TransferHistory[count - 1].timeStamp) * 1000,
       )
-      // A few distinct token symbols, just so we can see what is in there
       const symbols = [...new Set(erc20TransferHistory.map((t) => t.tokenSymbol))]
       const symbolText =
         symbols.slice(0, 5).join(', ') + (symbols.length > 5 ? ', ...' : '')
@@ -544,18 +548,16 @@ function App() {
     }
   }
 
-  // DEV ONLY: the same kind of summary for the hidden ERC-721 dataset.
   let erc721Summary = ''
   if (erc721TransferHistory !== null) {
     const count = erc721TransferHistory.length
     if (count === 0) {
-      erc721Summary = 'ERC-721 analysis data: 0 transfers loaded'
+      erc721Summary = 'ERC-721: No activity found'
     } else {
       const newest = new Date(Number(erc721TransferHistory[0].timeStamp) * 1000)
       const oldest = new Date(
         Number(erc721TransferHistory[count - 1].timeStamp) * 1000,
       )
-      // A few distinct collection names, just so we can see what is in there
       const collections = [...new Set(erc721TransferHistory.map((t) => t.tokenName))]
       const collectionText =
         collections.slice(0, 5).join(', ') + (collections.length > 5 ? ', ...' : '')
@@ -567,12 +569,11 @@ function App() {
     }
   }
 
-  // DEV ONLY: the same kind of summary for the hidden ERC-1155 dataset.
   let erc1155Summary = ''
   if (erc1155TransferHistory !== null) {
     const count = erc1155TransferHistory.length
     if (count === 0) {
-      erc1155Summary = 'ERC-1155 analysis data: 0 transfers loaded'
+      erc1155Summary = 'ERC-1155: No activity found'
     } else {
       const newest = new Date(Number(erc1155TransferHistory[0].timeStamp) * 1000)
       const oldest = new Date(
@@ -585,12 +586,11 @@ function App() {
     }
   }
 
-  // DEV ONLY: the same kind of summary for the hidden internal-tx dataset.
   let internalSummary = ''
   if (internalTransactionHistory !== null) {
     const count = internalTransactionHistory.length
     if (count === 0) {
-      internalSummary = 'Internal transaction analysis data: 0 records loaded'
+      internalSummary = 'Internal: No activity found'
     } else {
       const newest = new Date(Number(internalTransactionHistory[0].timeStamp) * 1000)
       const oldest = new Date(
@@ -606,7 +606,13 @@ function App() {
   // DEV ONLY: counts of the derived unified Activity[] by source type.
   // The total must equal the sum of the five raw dataset counts.
   let unifiedSummary = ''
-  if (unifiedActivities.length > 0) {
+  const anyLoaded =
+    normalTransactionHistory !== null ||
+    erc20TransferHistory !== null ||
+    erc721TransferHistory !== null ||
+    erc1155TransferHistory !== null ||
+    internalTransactionHistory !== null
+  if (anyLoaded) {
     const counts = { normal: 0, erc20: 0, erc721: 0, erc1155: 0, internal: 0 }
     for (const activity of unifiedActivities) {
       counts[activity.sourceType] += 1
@@ -614,7 +620,12 @@ function App() {
     unifiedSummary =
       `Unified activity: ${unifiedActivities.length} records — ` +
       `Normal ${counts.normal} · ERC20 ${counts.erc20} · ERC721 ${counts.erc721} · ` +
-      `ERC1155 ${counts.erc1155} · Internal ${counts.internal}`
+      `ERC1155 ${counts.erc1155} · Internal ${counts.internal}` +
+      (unifiedActivityComplete
+        ? ' · complete'
+        : failedSources.length > 0
+          ? ` · INCOMPLETE (failed: ${failedSources.join(', ')})`
+          : ' · loading')
   }
 
   // App.tsx owns the state and logic. Below, it only hands data
@@ -668,15 +679,16 @@ function App() {
             firstObserved={firstObserved}
             firstObservedChecked={firstObservedChecked}
             firstObservedError={firstObservedError}
-            lastActive={lastActive}
+            lastObserved={lastObserved}
+            activityComplete={unifiedActivityComplete}
+            activityFailed={failedSources.length > 0}
           />
 
-          <TransactionList
-            transactions={recentTransactions}
-            transactionError={
-              historyError ? 'Unable to fetch transaction history' : ''
-            }
-            analyzedAddress={analyzedAddress}
+          <WalletOrbit
+            walletAddress={analyzedAddress}
+            items={orbitItems}
+            complete={unifiedActivityComplete}
+            failedSources={failedSources}
           />
         </>
       )}
@@ -686,17 +698,17 @@ function App() {
           Check Backend
         </button>
         {backendStatus && <span>Backend Status: {backendStatus}</span>}
-        {/* DEV ONLY: remove these lines when Wallet Orbit takes over */}
+        {/* DEV ONLY: status lines for the five raw datasets */}
         {historySummary && <span>{historySummary}</span>}
-        {historyError && <span>{historyError}</span>}
+        {historyError && <span>Normal transactions: Failed</span>}
         {erc20Summary && <span>{erc20Summary}</span>}
-        {erc20Error && <span>{erc20Error}</span>}
+        {erc20Error && <span>ERC-20: Failed</span>}
         {erc721Summary && <span>{erc721Summary}</span>}
-        {erc721Error && <span>{erc721Error}</span>}
+        {erc721Error && <span>ERC-721: Failed</span>}
         {erc1155Summary && <span>{erc1155Summary}</span>}
-        {erc1155Error && <span>{erc1155Error}</span>}
+        {erc1155Error && <span>ERC-1155: Failed</span>}
         {internalSummary && <span>{internalSummary}</span>}
-        {internalError && <span>{internalError}</span>}
+        {internalError && <span>Internal: Failed</span>}
         {unifiedSummary && <span>{unifiedSummary}</span>}
       </footer>
     </main>

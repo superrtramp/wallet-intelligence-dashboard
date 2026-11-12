@@ -1,20 +1,25 @@
 import type { FirstObservedActivity } from '../types'
+import type { LastObservedActivity } from '../activity'
 import { formatDateTime, formatTimeAgo, formatWalletAge } from '../utils'
 
 type Props = {
   firstObserved: FirstObservedActivity | null
   firstObservedChecked: boolean
   firstObservedError: string
-  lastActive: Date | null
+  // Only non-null when the unified Activity[] is COMPLETE.
+  lastObserved: LastObservedActivity | null
+  activityComplete: boolean // all five sources resolved (empty counts as resolved)
+  activityFailed: boolean // at least one source really failed
 }
 
 export default function ActivitySummary({
   firstObserved,
   firstObservedChecked,
   firstObservedError,
-  lastActive,
+  lastObserved,
+  activityComplete,
+  activityFailed,
 }: Props) {
-  // Dates are derived here from the Unix-seconds timestamp.
   const firstObservedDate = firstObserved
     ? new Date(Number(firstObserved.timeStamp) * 1000)
     : null
@@ -28,9 +33,30 @@ export default function ActivitySummary({
   }
 
   // If several sources tie at the earliest moment, show all of them.
-  const sourceText = firstObserved
+  const firstSourceText = firstObserved
     ? firstObserved.sources.map((s) => s.sourceLabel).join(' + ')
     : '—'
+
+  // Last Observed: authoritative only when the unified data is complete.
+  const lastObservedDate = lastObserved
+    ? new Date(Number(lastObserved.timeStamp) * 1000)
+    : null
+
+  let lastObservedContent = <>—</>
+  if (activityComplete) {
+    lastObservedContent = lastObservedDate ? (
+      <>
+        <span>{formatTimeAgo(lastObservedDate)}</span>
+        <span className="stat-sub">{formatDateTime(lastObservedDate)}</span>
+      </>
+    ) : (
+      <>No activity found</>
+    )
+  } else if (activityFailed) {
+    lastObservedContent = <>Unavailable — activity data incomplete</>
+  }
+
+  const lastSourceText = lastObserved ? lastObserved.sourceLabels.join(' + ') : '—'
 
   return (
     <section className="card">
@@ -48,33 +74,28 @@ export default function ActivitySummary({
           <dd>{firstObservedText}</dd>
         </div>
         <div className="stat">
-          <dt>Source</dt>
-          <dd>{sourceText}</dd>
+          <dt>First Observed Source</dt>
+          <dd>{firstSourceText}</dd>
         </div>
         <div className="stat">
           <dt>Wallet Age</dt>
           <dd>{firstObservedDate ? formatWalletAge(firstObservedDate) : '—'}</dd>
         </div>
         <div className="stat">
-          <dt>Last Active</dt>
-          <dd>
-            {lastActive ? (
-              <>
-                <span>{formatTimeAgo(lastActive)}</span>
-                <span className="stat-sub">{formatDateTime(lastActive)}</span>
-              </>
-            ) : (
-              '—'
-            )}
-          </dd>
+          <dt>Last Observed Activity</dt>
+          <dd>{lastObservedContent}</dd>
+        </div>
+        <div className="stat">
+          <dt>Last Observed Source</dt>
+          <dd>{lastSourceText}</dd>
         </div>
       </dl>
 
       <p className="hint">
-        First Observed Activity is the earliest activity found across normal,
-        ERC-20, ERC-721, ERC-1155 and internal transactions indexed by Etherscan.
-        It is not the date the wallet was created. Last Active uses normal
-        transactions only.
+        Based on normal, ERC-20, ERC-721, ERC-1155 and internal activity indexed
+        by Etherscan. First Observed Activity is not the date the wallet was
+        created. Last Observed Activity is computed from the most recent records
+        we fetched.
       </p>
     </section>
   )

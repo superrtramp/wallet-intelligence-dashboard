@@ -102,8 +102,7 @@ app.get('/api/health', (req, res) => {
 })
 
 // --- Latest 5 normal transactions -----------------------------------------
-// Kept for compatibility/debugging. The frontend's Analyze flow no longer
-// calls it: the latest 5 now come from the first 5 records of /api/history.
+// Kept for compatibility/debugging. The frontend no longer calls it.
 
 app.get('/api/transactions/:address', async (req, res) => {
   const { address } = req.params
@@ -130,8 +129,6 @@ app.get('/api/transactions/:address', async (req, res) => {
       `https://api.etherscan.io/v2/api?${params}`,
     )
 
-    // Etherscan can answer HTTP 200 with an error message in `result`,
-    // so only an array counts as success.
     if (!Array.isArray(data.result)) {
       return res.status(502).json({ error: 'Unable to fetch transactions' })
     }
@@ -169,6 +166,7 @@ const FIRST_OBSERVED_SOURCES = [
 ]
 
 // Etherscan reports "no data" as status 0 with a text message.
+// This is a SUCCESSFUL empty answer, not a failure. Shared by every route below.
 function isNoDataResponse(data) {
   const text = `${data?.message ?? ''} ${
     typeof data?.result === 'string' ? data.result : ''
@@ -275,7 +273,7 @@ app.get('/api/first-observed/:address', async (req, res) => {
   }
 })
 
-// --- Historical normal-transaction dataset (for analysis, not UI) ---------
+// --- Historical normal-transaction dataset (for analysis) -----------------
 
 // Size of our initial normal-transaction analysis window.
 const HISTORY_LIMIT = 1000
@@ -306,6 +304,21 @@ app.get('/api/history/:address', async (req, res) => {
     )
 
     if (!Array.isArray(data.result)) {
+      // Valid "no data" = successful empty dataset (HTTP 200).
+      if (isNoDataResponse(data)) {
+        return res.json({
+          transactions: [],
+          requestedLimit: HISTORY_LIMIT,
+          mayHaveMore: false,
+        })
+      }
+
+      // Anything else is a REAL failure. Never report it as an empty wallet.
+      console.error('Normal history Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
       return res.status(502).json({ error: 'Unable to fetch transaction history' })
     }
 
@@ -329,11 +342,12 @@ app.get('/api/history/:address', async (req, res) => {
       mayHaveMore: transactions.length >= HISTORY_LIMIT,
     })
   } catch (err) {
+    console.error('Normal history request failed:', err.message)
     res.status(500).json({ error: 'Unable to fetch transaction history' })
   }
 })
 
-// --- Historical ERC-20 transfer dataset (for analysis, not UI) ------------
+// --- Historical ERC-20 transfer dataset (for analysis) --------------------
 
 // Size of our initial ERC-20 transfer analysis window.
 const ERC20_LIMIT = 1000
@@ -364,6 +378,20 @@ app.get('/api/erc20-history/:address', async (req, res) => {
     )
 
     if (!Array.isArray(data.result)) {
+      // Valid "no data" = successful empty dataset (HTTP 200).
+      if (isNoDataResponse(data)) {
+        return res.json({
+          transfers: [],
+          requestedLimit: ERC20_LIMIT,
+          mayHaveMore: false,
+        })
+      }
+
+      console.error('ERC-20 Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
       return res.status(502).json({ error: 'Unable to fetch ERC-20 history' })
     }
 
@@ -394,14 +422,14 @@ app.get('/api/erc20-history/:address', async (req, res) => {
       mayHaveMore: transfers.length >= ERC20_LIMIT,
     })
   } catch (err) {
+    console.error('ERC-20 request failed:', err.message)
     res.status(500).json({ error: 'Unable to fetch ERC-20 history' })
   }
 })
 
-// --- Historical ERC-721 (NFT) transfer dataset (analysis, not UI) ---------
+// --- Historical ERC-721 (NFT) transfer dataset (for analysis) -------------
 
 // Size of our initial ERC-721 transfer analysis window.
-// Reduced from 1000 during debugging; kept at 200 for now.
 const ERC721_LIMIT = 200
 
 app.get('/api/erc721-history/:address', async (req, res) => {
@@ -430,25 +458,21 @@ app.get('/api/erc721-history/:address', async (req, res) => {
     )
 
     if (!Array.isArray(data.result)) {
-      // Log only safe upstream information. Never the URL or the API key.
-      console.error('ERC-721 Etherscan error:', {
-        status: data.status,
-        message: data.message,
-        result: data.result,
-      })
-
-      // A legitimate "no NFT transfers" answer is a successful empty dataset.
-      const text = `${data.message ?? ''} ${
-        typeof data.result === 'string' ? data.result : ''
-      }`.toLowerCase()
-
-      if (text.includes('no transactions found') || text.includes('no records found')) {
+      // Valid "no data" = successful empty dataset (HTTP 200).
+      if (isNoDataResponse(data)) {
         return res.json({
           transfers: [],
           requestedLimit: ERC721_LIMIT,
           mayHaveMore: false,
         })
       }
+
+      // Log only safe upstream information. Never the URL or the API key.
+      console.error('ERC-721 Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
 
       return res.status(502).json({
         error: 'Unable to fetch ERC-721 history',
@@ -490,7 +514,7 @@ app.get('/api/erc721-history/:address', async (req, res) => {
   }
 })
 
-// --- Historical ERC-1155 (multi-token) transfer dataset (analysis, not UI) -
+// --- Historical ERC-1155 (multi-token) transfer dataset (for analysis) ----
 
 // Size of our initial ERC-1155 transfer analysis window.
 const ERC1155_LIMIT = 200
@@ -516,26 +540,13 @@ app.get('/api/erc1155-history/:address', async (req, res) => {
   })
 
   try {
-    // Same shared gateway as every other Etherscan request: scheduled,
-    // rate-limit-aware, one retry.
     const data = await fetchEtherscanJson(
       `https://api.etherscan.io/v2/api?${params}`,
     )
 
     if (!Array.isArray(data.result)) {
-      // Log only safe upstream information. Never the URL or the API key.
-      console.error('ERC-1155 Etherscan error:', {
-        status: data.status,
-        message: data.message,
-        result: data.result,
-      })
-
-      // A legitimate "no transfers" answer is a successful empty dataset.
-      const text = `${data.message ?? ''} ${
-        typeof data.result === 'string' ? data.result : ''
-      }`.toLowerCase()
-
-      if (text.includes('no transactions found') || text.includes('no records found')) {
+      // Valid "no data" = successful empty dataset (HTTP 200).
+      if (isNoDataResponse(data)) {
         return res.json({
           transfers: [],
           requestedLimit: ERC1155_LIMIT,
@@ -543,13 +554,19 @@ app.get('/api/erc1155-history/:address', async (req, res) => {
         })
       }
 
+      // Log only safe upstream information. Never the URL or the API key.
+      console.error('ERC-1155 Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
+
       return res.status(502).json({ error: 'Unable to fetch ERC-1155 history' })
     }
 
     // One record = one ERC-1155 transfer entry. A batch transaction can
     // produce several records with the same `hash`, so we do NOT deduplicate
-    // or combine them. tokenID and tokenValue stay as strings. Zero-address
-    // from/to values are kept untouched (mint/burn is interpreted later).
+    // or combine them. tokenID and tokenValue stay as strings.
     const transfers = data.result.map((t) => ({
       hash: t.hash,
       blockNumber: t.blockNumber,
@@ -570,7 +587,6 @@ app.get('/api/erc1155-history/:address', async (req, res) => {
     res.json({
       transfers,
       requestedLimit: ERC1155_LIMIT,
-      // Only means the returned count reached our configured limit.
       mayHaveMore: transfers.length >= ERC1155_LIMIT,
     })
   } catch (err) {
@@ -579,7 +595,7 @@ app.get('/api/erc1155-history/:address', async (req, res) => {
   }
 })
 
-// --- Historical internal-transaction dataset (for analysis, not UI) -------
+// --- Historical internal-transaction dataset (for analysis) ---------------
 
 // Size of our initial internal-transaction analysis window.
 const INTERNAL_LIMIT = 1000
@@ -605,27 +621,13 @@ app.get('/api/internal-history/:address', async (req, res) => {
   })
 
   try {
-    // Same shared gateway as every other Etherscan request: scheduled,
-    // rate-limit-aware, one retry.
     const data = await fetchEtherscanJson(
       `https://api.etherscan.io/v2/api?${params}`,
     )
 
     if (!Array.isArray(data.result)) {
-      // Log only safe upstream information. Never the URL or the API key.
-      console.error('Internal-tx Etherscan error:', {
-        status: data.status,
-        message: data.message,
-        result: data.result,
-      })
-
-      // A legitimate "no internal transactions" answer is a successful
-      // empty dataset.
-      const text = `${data.message ?? ''} ${
-        typeof data.result === 'string' ? data.result : ''
-      }`.toLowerCase()
-
-      if (text.includes('no transactions found') || text.includes('no records found')) {
+      // Valid "no data" = successful empty dataset (HTTP 200).
+      if (isNoDataResponse(data)) {
         return res.json({
           transactions: [],
           requestedLimit: INTERNAL_LIMIT,
@@ -633,13 +635,18 @@ app.get('/api/internal-history/:address', async (req, res) => {
         })
       }
 
+      // Log only safe upstream information. Never the URL or the API key.
+      console.error('Internal-tx Etherscan error:', {
+        status: data.status,
+        message: data.message,
+        result: data.result,
+      })
+
       return res.status(502).json({ error: 'Unable to fetch internal history' })
     }
 
     // One record = one internal operation. Several records can share one
     // `hash`; `traceId` tells them apart. We do NOT deduplicate or merge.
-    // All numeric values stay as strings. Empty `to` / `contractAddress`
-    // values are kept exactly as returned.
     const transactions = data.result.map((t) => ({
       blockNumber: t.blockNumber,
       timeStamp: t.timeStamp,
@@ -660,7 +667,6 @@ app.get('/api/internal-history/:address', async (req, res) => {
     res.json({
       transactions,
       requestedLimit: INTERNAL_LIMIT,
-      // Only means the returned count reached our configured limit.
       mayHaveMore: transactions.length >= INTERNAL_LIMIT,
     })
   } catch (err) {
