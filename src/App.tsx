@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   createPublicClient,
   http,
@@ -14,11 +14,14 @@ import type {
   ERC20Transfer,
   ERC721HistoryResponse,
   ERC721Transfer,
+  FirstObservedActivity,
+  FirstObservedResponse,
   HistoryResponse,
   InternalHistoryResponse,
   InternalTransaction,
   Transaction,
 } from './types'
+import { buildUnifiedActivities } from './activity'
 import { formatDateTime } from './utils'
 import WalletSummary from './components/WalletSummary'
 import ActivitySummary from './components/ActivitySummary'
@@ -44,12 +47,6 @@ const backupClient = makeClient(BACKUP_RPC_URL)
 type RpcClient = ReturnType<typeof makeClient>
 
 // --- Types -------------------------------------------------------------
-type FirstSeenResponse = {
-  hash?: string
-  blockNumber?: string
-  timeStamp?: string
-  firstSeen?: null
-}
 
 // The ONE shape the rest of the app uses, no matter which provider answered.
 type WalletData = {
@@ -125,11 +122,13 @@ async function getWalletDataFromEtherscanFallback(
   )
 }
 
-async function fetchFirstSeen(address: string): Promise<FirstSeenResponse> {
-  const response = await fetch(`http://localhost:3001/api/first-seen/${address}`)
+// V2.7.4: ONE request to our backend. The backend internally performs five
+// scheduled Etherscan lookups; the frontend neither knows nor cares.
+async function fetchFirstObserved(address: string): Promise<FirstObservedResponse> {
+  const response = await fetch(`http://localhost:3001/api/first-observed/${address}`)
 
   if (!response.ok) {
-    throw new Error('First seen request failed')
+    throw new Error('First observed request failed')
   }
 
   return response.json()
@@ -200,47 +199,42 @@ function App() {
   const [blockNumber, setBlockNumber] = useState('')
   // Which source actually supplied the wallet data ('' = none yet)
   const [walletDataSource, setWalletDataSource] = useState<WalletDataSource | ''>('')
-  // ANALYSIS data: up to ~1000 normal transactions (Ethereum transaction-level
-  // activity). The Recent Transactions UI is DERIVED from this (see below).
-  // null = not loaded yet
+
+  // --- RAW datasets. They stay separate and intact. Never rendered. ---
+  // ANALYSIS data: up to ~1000 normal transactions. The Recent Transactions
+  // UI is DERIVED from this (see below). null = not loaded yet
   const [normalTransactionHistory, setNormalTransactionHistory] =
     useState<Transaction[] | null>(null)
   // true if the window was full, so older transactions may exist
   const [historyMayHaveMore, setHistoryMayHaveMore] = useState(false)
   const [historyError, setHistoryError] = useState('')
-  // ANALYSIS data: up to ~1000 ERC-20 transfer EVENTS (fungible token movement).
-  // Kept separate from normal transactions on purpose. Never rendered.
-  // null = not loaded yet
+  // Up to ~1000 ERC-20 transfer EVENTS (fungible token movement)
   const [erc20TransferHistory, setErc20TransferHistory] =
     useState<ERC20Transfer[] | null>(null)
   const [erc20MayHaveMore, setErc20MayHaveMore] = useState(false)
   const [erc20Error, setErc20Error] = useState('')
-  // ANALYSIS data: up to ~200 ERC-721 transfer EVENTS (unique NFT movement).
-  // Separate from the other datasets on purpose. Never rendered.
-  // null = not loaded yet
+  // Up to ~200 ERC-721 transfer EVENTS (unique NFT movement)
   const [erc721TransferHistory, setErc721TransferHistory] =
     useState<ERC721Transfer[] | null>(null)
   const [erc721MayHaveMore, setErc721MayHaveMore] = useState(false)
   const [erc721Error, setErc721Error] = useState('')
-  // ANALYSIS data: up to ~200 ERC-1155 transfer RECORDS (multi-token movement).
-  // Separate from the other datasets on purpose. Never rendered.
-  // null = not loaded yet
+  // Up to ~200 ERC-1155 transfer RECORDS (multi-token movement)
   const [erc1155TransferHistory, setErc1155TransferHistory] =
     useState<ERC1155Transfer[] | null>(null)
   const [erc1155MayHaveMore, setErc1155MayHaveMore] = useState(false)
   const [erc1155Error, setErc1155Error] = useState('')
-  // ANALYSIS data: up to ~1000 INTERNAL transaction records (value movement
-  // and calls produced during contract execution). Separate from every other
-  // dataset on purpose. Never rendered.
-  // null = not loaded yet
+  // Up to ~1000 INTERNAL transaction records (contract execution traces)
   const [internalTransactionHistory, setInternalTransactionHistory] =
     useState<InternalTransaction[] | null>(null)
   const [internalMayHaveMore, setInternalMayHaveMore] = useState(false)
   const [internalError, setInternalError] = useState('')
-  // null = not loaded yet
-  const [firstSeen, setFirstSeen] = useState<Date | null>(null)
-  const [firstSeenChecked, setFirstSeenChecked] = useState(false)
-  const [firstSeenError, setFirstSeenError] = useState('')
+
+  // First Observed Activity: earliest activity across all five sources.
+  // firstObservedChecked separates "looked, found nothing" from "not loaded yet".
+  const [firstObserved, setFirstObserved] = useState<FirstObservedActivity | null>(null)
+  const [firstObservedChecked, setFirstObservedChecked] = useState(false)
+  const [firstObservedError, setFirstObservedError] = useState('')
+
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [backendStatus, setBackendStatus] = useState('')
@@ -255,6 +249,47 @@ function App() {
     recentTransactions !== null && recentTransactions.length > 0
       ? new Date(Number(recentTransactions[0].timeStamp) * 1000)
       : null
+
+  // DERIVED: the unified Activity[] is rebuilt from the five raw datasets
+  // whenever any of them changes. A dataset that has not loaded (or failed)
+  // simply contributes nothing.
+  const unifiedActivities = useMemo(
+    () =>
+      buildUnifiedActivities(
+        normalTransactionHistory ?? [],
+        erc20TransferHistory ?? [],
+        erc721TransferHistory ?? [],
+        erc1155TransferHistory ?? [],
+        internalTransactionHistory ?? [],
+      ),
+    [
+      normalTransactionHistory,
+      erc20TransferHistory,
+      erc721TransferHistory,
+      erc1155TransferHistory,
+      internalTransactionHistory,
+    ],
+  )
+
+  // DEV ONLY: log the unified array once all five raw datasets have arrived.
+  useEffect(() => {
+    if (
+      normalTransactionHistory !== null &&
+      erc20TransferHistory !== null &&
+      erc721TransferHistory !== null &&
+      erc1155TransferHistory !== null &&
+      internalTransactionHistory !== null
+    ) {
+      console.log(`Unified activities: ${unifiedActivities.length}`, unifiedActivities)
+    }
+  }, [
+    unifiedActivities,
+    normalTransactionHistory,
+    erc20TransferHistory,
+    erc721TransferHistory,
+    erc1155TransferHistory,
+    internalTransactionHistory,
+  ])
 
   // Copies normalized wallet data into React state. It doesn't care
   // which provider produced the data, only which label to show.
@@ -386,17 +421,15 @@ function App() {
     }
   }
 
-  async function loadFirstSeen(validAddress: string) {
+  // Its own try/catch. If the backend could not determine First Observed
+  // Activity reliably, we show an error instead of a possibly wrong date.
+  async function loadFirstObserved(validAddress: string) {
     try {
-      const data = await fetchFirstSeen(validAddress)
-
-      if (data.timeStamp) {
-        setFirstSeen(new Date(Number(data.timeStamp) * 1000))
-      }
-
-      setFirstSeenChecked(true)
+      const data = await fetchFirstObserved(validAddress)
+      setFirstObserved(data.firstObserved)
+      setFirstObservedChecked(true)
     } catch (err) {
-      setFirstSeenError('Unable to fetch wallet age')
+      setFirstObservedError('Unable to determine first observed activity')
     }
   }
 
@@ -422,9 +455,9 @@ function App() {
     setInternalTransactionHistory(null)
     setInternalMayHaveMore(false)
     setInternalError('')
-    setFirstSeen(null)
-    setFirstSeenChecked(false)
-    setFirstSeenError('')
+    setFirstObserved(null)
+    setFirstObservedChecked(false)
+    setFirstObservedError('')
     setAnalyzedAddress('')
 
     if (!isAddress(address)) {
@@ -442,11 +475,11 @@ function App() {
     await Promise.all([
       loadWalletData(address),
       loadHistory(address),
-      loadFirstSeen(address),
       loadErc20History(address),
       loadErc721History(address),
       loadErc1155History(address),
       loadInternalHistory(address),
+      loadFirstObserved(address),
     ])
 
     setLoading(false)
@@ -570,6 +603,20 @@ function App() {
     }
   }
 
+  // DEV ONLY: counts of the derived unified Activity[] by source type.
+  // The total must equal the sum of the five raw dataset counts.
+  let unifiedSummary = ''
+  if (unifiedActivities.length > 0) {
+    const counts = { normal: 0, erc20: 0, erc721: 0, erc1155: 0, internal: 0 }
+    for (const activity of unifiedActivities) {
+      counts[activity.sourceType] += 1
+    }
+    unifiedSummary =
+      `Unified activity: ${unifiedActivities.length} records — ` +
+      `Normal ${counts.normal} · ERC20 ${counts.erc20} · ERC721 ${counts.erc721} · ` +
+      `ERC1155 ${counts.erc1155} · Internal ${counts.internal}`
+  }
+
   // App.tsx owns the state and logic. Below, it only hands data
   // to presentation components through props.
   return (
@@ -618,9 +665,9 @@ function App() {
           />
 
           <ActivitySummary
-            firstSeen={firstSeen}
-            firstSeenChecked={firstSeenChecked}
-            firstSeenError={firstSeenError}
+            firstObserved={firstObserved}
+            firstObservedChecked={firstObservedChecked}
+            firstObservedError={firstObservedError}
             lastActive={lastActive}
           />
 
@@ -650,6 +697,7 @@ function App() {
         {erc1155Error && <span>{erc1155Error}</span>}
         {internalSummary && <span>{internalSummary}</span>}
         {internalError && <span>{internalError}</span>}
+        {unifiedSummary && <span>{unifiedSummary}</span>}
       </footer>
     </main>
   )

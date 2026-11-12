@@ -124,3 +124,119 @@ export type InternalHistoryResponse = {
   requestedLimit: number
   mayHaveMore: boolean
 }
+
+// --- V2.7.4: unified Activity model ----------------------------------------
+// Activity[] is DERIVED from the five raw datasets. It never replaces them.
+// `sourceType` is the discriminant: checking it tells TypeScript (and future
+// code) exactly which extra fields exist and what `to`/`from` mean.
+// Records are never deduplicated by hash: same hash, different layers.
+
+export type ActivitySourceType =
+  | 'normal'
+  | 'erc20'
+  | 'erc721'
+  | 'erc1155'
+  | 'internal'
+
+// Fields every Activity variant exposes directly.
+type ActivityCommon = {
+  hash: string
+  blockNumber: string
+  timeStamp: string // Unix seconds, as a string
+  from: string
+  to: string // may be empty (contract creation / internal records)
+}
+
+export type NormalActivity = ActivityCommon & {
+  sourceType: 'normal'
+  sourceLabel: 'Normal transaction'
+  value: string // wei
+  input: string
+  methodId: string
+  functionName: string
+  contractAddress: string
+}
+
+export type Erc20Activity = ActivityCommon & {
+  sourceType: 'erc20'
+  sourceLabel: 'ERC-20 transfer'
+  value: string // RAW token units; read with tokenDecimal
+  contractAddress: string // the token contract
+  tokenName: string
+  tokenSymbol: string
+  tokenDecimal: string
+  transactionIndex: string
+  methodId?: string
+  functionName?: string
+  statusRep?: string
+}
+
+export type Erc721Activity = ActivityCommon & {
+  sourceType: 'erc721'
+  sourceLabel: 'ERC-721 transfer'
+  contractAddress: string // the NFT collection contract
+  tokenID: string
+  tokenName: string
+  tokenSymbol: string
+  transactionIndex: string
+  methodId?: string
+  functionName?: string
+}
+
+export type Erc1155Activity = ActivityCommon & {
+  sourceType: 'erc1155'
+  sourceLabel: 'ERC-1155 transfer'
+  contractAddress: string
+  tokenID: string
+  tokenValue: string
+  tokenName: string
+  tokenSymbol: string
+  transactionIndex: string
+  methodId?: string
+  functionName?: string
+}
+
+export type InternalActivity = ActivityCommon & {
+  sourceType: 'internal'
+  sourceLabel: 'Internal transaction'
+  value: string // wei
+  contractAddress: string
+  input: string
+  type: string
+  gas: string
+  gasUsed: string
+  traceId: string
+  isError: string
+  errCode: string
+}
+
+export type Activity =
+  | NormalActivity
+  | Erc20Activity
+  | Erc721Activity
+  | Erc1155Activity
+  | InternalActivity
+
+// --- V2.7.4: First Observed Activity ---------------------------------------
+
+export type FirstObservedSource = {
+  sourceType: ActivitySourceType
+  sourceLabel: string
+  hash: string
+}
+
+// The earliest activity we can observe across all five supported sources.
+// NOT the wallet's key-creation time.
+export type FirstObservedActivity = {
+  timeStamp: string // Unix seconds, as a string
+  hash: string
+  sourceType: ActivitySourceType
+  sourceLabel: string
+  // Every source that ties at the earliest timestamp (at least one entry).
+  sources: FirstObservedSource[]
+}
+
+// Response shape of GET /api/first-observed/:address
+export type FirstObservedResponse = {
+  firstObserved: FirstObservedActivity | null // null = no activity in any source
+}

@@ -155,19 +155,36 @@ app.get('/api/transactions/:address', async (req, res) => {
   }
 })
 
-// --- First Seen (normal transactions only, for now) -----------------------
+// --- First Observed Activity -----------------------------------------------
+// The earliest activity visible across ALL five indexed activity families.
+// This is NOT the wallet's key-creation time.
 
-app.get('/api/first-seen/:address', async (req, res) => {
-  const { address } = req.params
+// The five families we ask about. Same shape for each, only the action differs.
+const FIRST_OBSERVED_SOURCES = [
+  { action: 'txlist', sourceType: 'normal', sourceLabel: 'Normal transaction' },
+  { action: 'tokentx', sourceType: 'erc20', sourceLabel: 'ERC-20 transfer' },
+  { action: 'tokennfttx', sourceType: 'erc721', sourceLabel: 'ERC-721 transfer' },
+  { action: 'token1155tx', sourceType: 'erc1155', sourceLabel: 'ERC-1155 transfer' },
+  { action: 'txlistinternal', sourceType: 'internal', sourceLabel: 'Internal transaction' },
+]
 
-  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
-    return res.status(400).json({ error: 'Invalid Ethereum address' })
-  }
+// Etherscan reports "no data" as status 0 with a text message.
+function isNoDataResponse(data) {
+  const text = `${data?.message ?? ''} ${
+    typeof data?.result === 'string' ? data.result : ''
+  }`.toLowerCase()
 
+  return text.includes('no transactions found') || text.includes('no records found')
+}
+
+// Asks Etherscan for the OLDEST single record of one family.
+// Returns one candidate, or null if the wallet has none of that kind.
+// THROWS on a real upstream failure (so we never report a possibly false date).
+async function fetchOldestActivityCandidate({ action, sourceType, sourceLabel }, address) {
   const params = new URLSearchParams({
     chainid: '1',
     module: 'account',
-    action: 'txlist',
+    action,
     address,
     startblock: '0',
     endblock: '99999999',
@@ -177,28 +194,84 @@ app.get('/api/first-seen/:address', async (req, res) => {
     apikey: ETHERSCAN_API_KEY,
   })
 
+  // Goes through the shared gateway: scheduled, rate-limit-aware, one retry.
+  const data = await fetchEtherscanJson(`https://api.etherscan.io/v2/api?${params}`)
+
+  if (!Array.isArray(data.result)) {
+    if (isNoDataResponse(data)) {
+      return null // legitimate: this wallet has none of this kind
+    }
+
+    // Safe to log: status/message/result only, never the URL or API key.
+    console.error(`First-observed (${sourceType}) Etherscan error:`, {
+      status: data.status,
+      message: data.message,
+      result: data.result,
+    })
+    throw new Error(`Etherscan failure for ${sourceType}`)
+  }
+
+  if (data.result.length === 0) {
+    return null
+  }
+
+  const oldest = data.result[0]
+
+  return {
+    sourceType,
+    sourceLabel,
+    hash: oldest.hash,
+    blockNumber: oldest.blockNumber,
+    timeStamp: oldest.timeStamp,
+  }
+}
+
+app.get('/api/first-observed/:address', async (req, res) => {
+  const { address } = req.params
+
+  if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+    return res.status(400).json({ error: 'Invalid Ethereum address' })
+  }
+
   try {
-    const data = await fetchEtherscanJson(
-      `https://api.etherscan.io/v2/api?${params}`,
+    // The five lookups are independent, so they all start now. They enter the
+    // global scheduler, which spaces their Etherscan start times.
+    // If ANY of them truly fails, Promise.all rejects and we return 502.
+    const results = await Promise.all(
+      FIRST_OBSERVED_SOURCES.map((source) =>
+        fetchOldestActivityCandidate(source, address),
+      ),
     )
 
-    if (!Array.isArray(data.result)) {
-      return res.status(502).json({ error: 'Unable to fetch first seen data' })
+    // null = this wallet has no activity of that kind. Not an error.
+    const candidates = results.filter((candidate) => candidate !== null)
+
+    if (candidates.length === 0) {
+      return res.json({ firstObserved: null })
     }
 
-    if (data.result.length === 0) {
-      return res.json({ firstSeen: null })
-    }
+    // Unix seconds fit safely in a JS number.
+    const earliest = Math.min(...candidates.map((c) => Number(c.timeStamp)))
 
-    const firstTx = data.result[0]
+    // Keep EVERY source that ties at the earliest moment (explainability).
+    const tied = candidates.filter((c) => Number(c.timeStamp) === earliest)
 
     res.json({
-      hash: firstTx.hash,
-      blockNumber: firstTx.blockNumber,
-      timeStamp: firstTx.timeStamp,
+      firstObserved: {
+        timeStamp: tied[0].timeStamp,
+        hash: tied[0].hash,
+        sourceType: tied[0].sourceType,
+        sourceLabel: tied[0].sourceLabel,
+        sources: tied.map((c) => ({
+          sourceType: c.sourceType,
+          sourceLabel: c.sourceLabel,
+          hash: c.hash,
+        })),
+      },
     })
   } catch (err) {
-    res.status(500).json({ error: 'Unable to fetch first seen data' })
+    console.error('First-observed request failed:', err.message)
+    res.status(502).json({ error: 'Unable to determine first observed activity' })
   }
 })
 
